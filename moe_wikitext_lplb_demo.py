@@ -15,6 +15,7 @@ import argparse
 import math
 import os
 import re
+import time
 from pathlib import Path
 from collections import Counter
 from typing import cast
@@ -31,11 +32,9 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from lplb import Planner
 
 
-NUM_PHYSICAL_EXPERTS = 64
-NUM_LOGICAL_EXPERTS = 56
+NUM_LOGICAL_EXPERTS = 64
 TOP_K = 8
 EP_SIZE = 4
-LOCAL_EXPERTS_PER_GPU = NUM_PHYSICAL_EXPERTS // EP_SIZE
 DEFAULT_SEQ_LEN = 64
 DEFAULT_HIDDEN_SIZE = 128
 DEFAULT_MOE_HIDDEN = 256
@@ -86,13 +85,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-train-tokens', type=int, default=120_000)
     parser.add_argument('--max-valid-tokens', type=int, default=20_000)
     parser.add_argument('--tokenizer-name', type=str, default='gpt2')
+    parser.add_argument('--redundants-per-rank', type=int, default=2)
+    parser.add_argument('--disable-load-balancing', action='store_true')
     parser.add_argument('--hidden-size', type=int, default=DEFAULT_HIDDEN_SIZE)
     parser.add_argument('--moe-hidden-size', type=int, default=DEFAULT_MOE_HIDDEN)
-    parser.add_argument('--num-layers', type=int, default=2)
+    parser.add_argument('--num-layers', type=int, default=4)
     parser.add_argument('--num-heads', type=int, default=4)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--weight-decay', type=float, default=0.1)
     parser.add_argument('--aux-loss-weight', type=float, default=0.01)
+    parser.add_argument('--profile-interval', type=int, default=10)
+    parser.add_argument('--profile-warmup', type=int, default=2)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--world-size', type=int, default=EP_SIZE)
     return parser.parse_args()
@@ -125,6 +128,32 @@ def is_main_process(rank: int) -> bool:
 def log(rank: int, message: str) -> None:
     if is_main_process(rank):
         print(message, flush=True)
+
+
+def maybe_cuda_synchronize(device: torch.device) -> None:
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+
+
+def reduce_mean_scalar(value: float, device: torch.device) -> float:
+    tensor = torch.tensor(value, device=device, dtype=torch.float64)
+    if dist.is_initialized():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor.div_(dist.get_world_size())
+    return float(tensor.item())
+
+
+def build_redundancy_topology(group_size: int, num_redundants_per_rank: int) -> torch.Tensor:
+    if num_redundants_per_rank < 0:
+        raise ValueError('redundants-per-rank must be non-negative')
+    if num_redundants_per_rank == 0:
+        return torch.empty(group_size, 0, dtype=torch.int32)
+
+    ranks = torch.arange(group_size, dtype=torch.int32)
+    topology = torch.empty(group_size, num_redundants_per_rank, dtype=torch.int32)
+    for column in range(num_redundants_per_rank):
+        topology[:, column] = (ranks + column + 1) % group_size
+    return topology
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+|[^\w\s]")
@@ -209,7 +238,9 @@ class LPLBMoE(nn.Module):
         num_logical_experts: int,
         num_physical_experts: int,
         top_k: int,
-        planner: Planner,
+        planner: Planner | None,
+        disable_load_balancing: bool,
+        static_log2phy: torch.Tensor | None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -217,6 +248,7 @@ class LPLBMoE(nn.Module):
         self.num_physical_experts = num_physical_experts
         self.top_k = top_k
         self.planner = planner
+        self.disable_load_balancing = disable_load_balancing
 
         self.router = nn.Linear(hidden_size, num_logical_experts, bias=False)
         self.experts = nn.ModuleList(
@@ -227,8 +259,15 @@ class LPLBMoE(nn.Module):
             torch.zeros(num_logical_experts, dtype=torch.int64),
             persistent=False,
         )
+        self.register_buffer(
+            'static_log2phy',
+            static_log2phy if static_log2phy is not None else torch.empty(0, 2, dtype=torch.int32),
+            persistent=False,
+        )
 
     def refresh_mapping(self, rank: int) -> None:
+        if self.disable_load_balancing or self.planner is None:
+            return
         workload_history = cast(torch.Tensor, self.workload_history)
         global_history = workload_history.clone()
         if dist.is_initialized():
@@ -265,12 +304,19 @@ class LPLBMoE(nn.Module):
         topk_logits, topk_logical = router_logits.topk(self.top_k, dim=-1)
         topk_weights = F.softmax(topk_logits.float(), dim=-1).to(dtype=flat.dtype)
 
-        counts = torch.bincount(topk_logical.reshape(-1), minlength=self.num_logical_experts)
-        workload_history = cast(torch.Tensor, self.workload_history)
-        workload_history.add_(counts)
+        if self.disable_load_balancing or self.planner is None:
+            static_log2phy = cast(torch.Tensor, self.static_log2phy)
+            if static_log2phy.numel() > 0:
+                topk_physical = static_log2phy[topk_logical, 0]
+            else:
+                topk_physical = topk_logical
+        else:
+            counts = torch.bincount(topk_logical.reshape(-1), minlength=self.num_logical_experts)
+            workload_history = cast(torch.Tensor, self.workload_history)
+            workload_history.add_(counts)
 
-        avail_counter = torch.zeros((), dtype=torch.int32, device=flat.device)
-        topk_physical = self.planner.run(topk_logical, avail_counter)
+            avail_counter = torch.zeros((), dtype=torch.int32, device=flat.device)
+            topk_physical = self.planner.run(topk_logical, avail_counter)
 
         token_indices = torch.arange(flat.size(0), device=flat.device).repeat_interleave(self.top_k)
         flat_inputs = flat.index_select(0, token_indices)
@@ -299,7 +345,9 @@ class TinyMoeBlock(nn.Module):
         num_logical_experts: int,
         num_physical_experts: int,
         top_k: int,
-        planner: Planner,
+        planner: Planner | None,
+        disable_load_balancing: bool,
+        static_log2phy: torch.Tensor | None,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size)
@@ -312,6 +360,8 @@ class TinyMoeBlock(nn.Module):
             num_physical_experts,
             top_k,
             planner,
+            disable_load_balancing,
+            static_log2phy,
         )
 
     def refresh_mapping(self, rank: int) -> None:
@@ -337,7 +387,9 @@ class TinyMoeLM(nn.Module):
         num_logical_experts: int,
         num_physical_experts: int,
         top_k: int,
-        planner: Planner,
+        planner: Planner | None,
+        disable_load_balancing: bool,
+        static_log2phy: torch.Tensor | None,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
@@ -353,6 +405,8 @@ class TinyMoeLM(nn.Module):
                     num_physical_experts,
                     top_k,
                     planner,
+                    disable_load_balancing,
+                    static_log2phy,
                 )
                 for _ in range(num_layers)
             ]
@@ -514,6 +568,11 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    disable_load_balancing = bool(args.disable_load_balancing or args.redundants_per_rank == 0)
+    num_logical_experts = NUM_LOGICAL_EXPERTS
+    num_physical_experts = num_logical_experts + args.redundants_per_rank * world_size
+    local_experts_per_gpu = num_physical_experts // world_size
+
     texts = build_corpus(args.cache_dir)
     tokenizer, train_dataset, valid_dataset = make_datasets(
         texts,
@@ -538,15 +597,20 @@ def main() -> None:
         shuffle=False,
     )
 
-    r2o = R2O_SQUARE_4P2E.to(device)
+    r2o = build_redundancy_topology(world_size, args.redundants_per_rank).to(device)
     planner_group = cast(dist.ProcessGroup, dist.new_group()) if distributed else None
-    planner = Planner(
-        r2o,
-        NUM_PHYSICAL_EXPERTS,
-        NUM_LOGICAL_EXPERTS,
-        ep_size=EP_SIZE,
-        group=planner_group,
-    )
+    planner: Planner | None = None
+    static_log2phy: torch.Tensor | None = None
+    if args.redundants_per_rank > 0:
+        planner = Planner(
+            r2o,
+            num_physical_experts,
+            num_logical_experts,
+            ep_size=world_size,
+            group=planner_group,
+        )
+        if disable_load_balancing:
+            _static_phy2log, static_log2phy, _static_logcnt = planner.update_redundancy_mapping()
 
     model = TinyMoeLM(
         vocab_size=len(tokenizer),
@@ -555,10 +619,12 @@ def main() -> None:
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         moe_hidden_size=args.moe_hidden_size,
-        num_logical_experts=NUM_LOGICAL_EXPERTS,
-        num_physical_experts=NUM_PHYSICAL_EXPERTS,
+        num_logical_experts=num_logical_experts,
+        num_physical_experts=num_physical_experts,
         top_k=TOP_K,
         planner=planner,
+        disable_load_balancing=disable_load_balancing,
+        static_log2phy=static_log2phy,
     ).to(device)
 
     if distributed:
@@ -580,15 +646,41 @@ def main() -> None:
         f'[rank {rank}] tokenizer={args.tokenizer_name} vocab={len(tokenizer)} '
         f'train_samples={len(train_dataset)} valid_samples={len(valid_dataset)}',
     )
-    log(rank, f'[rank {rank}] world_size={world_size} local_experts={LOCAL_EXPERTS_PER_GPU} top_k={TOP_K}')
+    log(
+        rank,
+        f'[rank {rank}] world_size={world_size} logical_experts={num_logical_experts} '
+        f'physical_experts={num_physical_experts} local_experts={local_experts_per_gpu} '
+        f'redundants_per_rank={args.redundants_per_rank} load_balancing={not disable_load_balancing} '
+        f'top_k={TOP_K}',
+    )
+
+    profile_enabled = args.profile_interval > 0
+    profile_window = max(1, args.profile_interval)
+    profile_sums = {
+        'total': 0.0,
+        'data': 0.0,
+        'refresh': 0.0,
+        'forward': 0.0,
+        'backward': 0.0,
+        'step': 0.0,
+    }
+    profile_count = 0
 
     data_iter = iter(train_loader)
     for step in range(args.steps):
+        step_should_profile = profile_enabled and step >= args.profile_warmup
+        step_total_start = time.perf_counter() if step_should_profile else None
+        data_start = time.perf_counter() if step_should_profile else None
         if train_sampler is not None:
             train_sampler.set_epoch(step)
 
         if step > 0 and step % args.refresh_interval == 0:
+            maybe_cuda_synchronize(device)
+            refresh_start = time.perf_counter() if step_should_profile else None
             base_model.refresh_mapping(rank)
+            if step_should_profile and refresh_start is not None:
+                maybe_cuda_synchronize(device)
+                profile_sums['refresh'] += time.perf_counter() - refresh_start
 
         try:
             input_ids, target_ids = next(data_iter)
@@ -596,19 +688,44 @@ def main() -> None:
             data_iter = iter(train_loader)
             input_ids, target_ids = next(data_iter)
 
+        if step_should_profile and data_start is not None:
+            maybe_cuda_synchronize(device)
+            profile_sums['data'] += time.perf_counter() - data_start
+
         input_ids = input_ids.to(device, non_blocking=True)
         target_ids = target_ids.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
+        maybe_cuda_synchronize(device)
+        forward_start = time.perf_counter() if step_should_profile else None
         logits, aux_loss = model(input_ids)
+        if step_should_profile and forward_start is not None:
+            maybe_cuda_synchronize(device)
+            profile_sums['forward'] += time.perf_counter() - forward_start
+
+        backward_start = time.perf_counter() if step_should_profile else None
         lm_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target_ids.reshape(-1))
         loss = lm_loss + args.aux_loss_weight * aux_loss
         loss.backward()
+        if step_should_profile and backward_start is not None:
+            maybe_cuda_synchronize(device)
+            profile_sums['backward'] += time.perf_counter() - backward_start
+
+        step_start = time.perf_counter() if step_should_profile else None
         optimizer.step()
+        if step_should_profile and step_start is not None:
+            maybe_cuda_synchronize(device)
+            profile_sums['step'] += time.perf_counter() - step_start
+
+        if step_should_profile and step_total_start is not None:
+            maybe_cuda_synchronize(device)
+            profile_sums['total'] += time.perf_counter() - step_total_start
+            profile_count += 1
 
         if is_main_process(rank) and step % 10 == 0:
             ppl = math.exp(min(float(lm_loss.item()), 20.0))
             print(
+                # step, loss, LM loss, aux loss, perplexity
                 f'step={step:04d} loss={float(loss.item()):.4f} '
                 f'lm={float(lm_loss.item()):.4f} aux={float(aux_loss.item()):.4f} ppl={ppl:.2f}',
                 flush=True,
@@ -618,6 +735,43 @@ def main() -> None:
             eval_loss = evaluate(model, valid_loader, device, args.aux_loss_weight)
             if is_main_process(rank):
                 print(f'eval step={step + 1:04d} loss={eval_loss:.4f}', flush=True)
+
+        if profile_enabled and profile_count > 0 and profile_count % profile_window == 0:
+            profile_values = torch.tensor(
+                [
+                    profile_sums['total'],
+                    profile_sums['data'],
+                    profile_sums['refresh'],
+                    profile_sums['forward'],
+                    profile_sums['backward'],
+                    profile_sums['step'],
+                ],
+                device=device,
+                dtype=torch.float64,
+            )
+            if dist.is_initialized():
+                dist.all_reduce(profile_values, op=dist.ReduceOp.SUM)
+                profile_values.div_(dist.get_world_size())
+
+            if is_main_process(rank):
+                avg = profile_values / profile_window
+                total_s = float(avg[0].item())
+                tokens_per_sec = (args.batch_size * world_size * args.seq_len) / max(total_s, 1e-12)
+                print(
+                    '[profile] '
+                    f'steps={step - profile_window + 2:04d}-{step + 1:04d} '
+                    f'total={avg[0].item() * 1e3:.2f}ms '
+                    f'data={avg[1].item() * 1e3:.2f}ms '
+                    f'refresh={avg[2].item() * 1e3:.2f}ms '
+                    f'forward={avg[3].item() * 1e3:.2f}ms '
+                    f'backward={avg[4].item() * 1e3:.2f}ms '
+                    f'optim={avg[5].item() * 1e3:.2f}ms '
+                    f'tokens_per_sec={tokens_per_sec:.2f}',
+                    flush=True,
+                )
+            for key in profile_sums:
+                profile_sums[key] = 0.0
+            profile_count = 0
 
     final_eval_loss = evaluate(model, valid_loader, device, args.aux_loss_weight)
     if is_main_process(rank):
