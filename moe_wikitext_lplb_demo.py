@@ -37,7 +37,7 @@ TOP_K = 8
 EP_SIZE = 4
 DEFAULT_SEQ_LEN = 64
 DEFAULT_HIDDEN_SIZE = 128
-DEFAULT_MOE_HIDDEN = 256
+DEFAULT_MOE_HIDDEN = 1024
 FALLBACK_VOCAB_SIZE = 8_000
 
 R2O_SQUARE_4P2E = torch.tensor(
@@ -78,12 +78,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--cache-dir', type=Path, default=Path.home() / '.cache' / 'lplb_moe_demo')
     parser.add_argument('--seq-len', type=int, default=DEFAULT_SEQ_LEN)
     parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--eval-batch-size', type=int, default=16)
     parser.add_argument('--steps', type=int, default=200)
-    parser.add_argument('--eval-interval', type=int, default=50)
     parser.add_argument('--refresh-interval', type=int, default=10)
     parser.add_argument('--max-train-tokens', type=int, default=120_000)
-    parser.add_argument('--max-valid-tokens', type=int, default=20_000)
     parser.add_argument('--tokenizer-name', type=str, default='gpt2')
     parser.add_argument('--redundants-per-rank', type=int, default=2)
     parser.add_argument('--disable-load-balancing', action='store_true')
@@ -95,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--weight-decay', type=float, default=0.1)
     parser.add_argument('--aux-loss-weight', type=float, default=0.01)
     parser.add_argument('--profile-interval', type=int, default=10)
-    parser.add_argument('--profile-warmup', type=int, default=2)
+    parser.add_argument('--profile-warmup', type=int, default=20)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--world-size', type=int, default=EP_SIZE)
     return parser.parse_args()
@@ -464,8 +461,7 @@ def make_datasets(
     tokenizer_name: str,
     seq_len: int,
     max_train_tokens: int,
-    max_valid_tokens: int,
-) -> tuple[PreTrainedTokenizerBase | SimpleTokenizer, SequenceDataset, SequenceDataset]:
+) -> tuple[PreTrainedTokenizerBase | SimpleTokenizer, SequenceDataset]:
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
         if tokenizer.pad_token is None:
@@ -484,10 +480,8 @@ def make_datasets(
         return token_ids[:limit]
 
     train_tokens = encode_corpus(texts['train'], max_train_tokens)
-    valid_tokens = encode_corpus(texts['valid'], max_valid_tokens)
     train_dataset = SequenceDataset(train_tokens, seq_len)
-    valid_dataset = SequenceDataset(valid_tokens, seq_len)
-    return tokenizer, train_dataset, valid_dataset
+    return tokenizer, train_dataset
 
 
 def make_dataloader(
@@ -523,32 +517,6 @@ def make_dataloader(
     )
 
 
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    data_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    device: torch.device,
-    aux_loss_weight: float,
-) -> float:
-    base_model = unwrap_model(model)
-    base_model.eval()
-    losses: list[float] = []
-    for batch_index, (input_ids, target_ids) in enumerate(data_loader):
-        if batch_index >= 20:
-            break
-        input_ids = input_ids.to(device, non_blocking=True)
-        target_ids = target_ids.to(device, non_blocking=True)
-        logits, aux_loss = model(input_ids)
-        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target_ids.reshape(-1))
-        loss = loss + aux_loss_weight * aux_loss
-        losses.append(float(loss.item()))
-    base_model.train()
-    avg_loss = torch.tensor(sum(losses) / max(1, len(losses)), device=device)
-    if dist.is_initialized():
-        dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-        avg_loss.div_(dist.get_world_size())
-    return float(avg_loss.item())
-
 
 def main() -> None:
     args = parse_args()
@@ -574,12 +542,11 @@ def main() -> None:
     local_experts_per_gpu = num_physical_experts // world_size
 
     texts = build_corpus(args.cache_dir)
-    tokenizer, train_dataset, valid_dataset = make_datasets(
+    tokenizer, train_dataset = make_datasets(
         texts,
         args.tokenizer_name,
         args.seq_len,
         args.max_train_tokens,
-        args.max_valid_tokens,
     )
 
     train_loader, train_sampler = make_dataloader(
@@ -588,13 +555,6 @@ def main() -> None:
         rank,
         world_size,
         shuffle=True,
-    )
-    valid_loader, _valid_sampler = make_dataloader(
-        valid_dataset,
-        args.eval_batch_size,
-        rank,
-        world_size,
-        shuffle=False,
     )
 
     r2o = build_redundancy_topology(world_size, args.redundants_per_rank).to(device)
@@ -644,7 +604,7 @@ def main() -> None:
     log(
         rank,
         f'[rank {rank}] tokenizer={args.tokenizer_name} vocab={len(tokenizer)} '
-        f'train_samples={len(train_dataset)} valid_samples={len(valid_dataset)}',
+        f'train_samples={len(train_dataset)}',
     )
     log(
         rank,
@@ -730,15 +690,6 @@ def main() -> None:
                 f'lm={float(lm_loss.item()):.4f} aux={float(aux_loss.item()):.4f} ppl={ppl:.2f}',
                 flush=True,
             )
-
-        if (step + 1) % args.eval_interval == 0:
-            eval_loss = evaluate(model, valid_loader, device, args.aux_loss_weight)
-            if is_main_process(rank):
-                print(f'eval step={step + 1:04d} loss={eval_loss:.4f}', flush=True)
-
-    final_eval_loss = evaluate(model, valid_loader, device, args.aux_loss_weight)
-    if is_main_process(rank):
-        print(f'final eval loss={final_eval_loss:.4f}', flush=True)
 
     # Print aggregated profiling summary
     if profile_enabled and profile_count > 0:
