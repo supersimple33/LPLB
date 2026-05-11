@@ -132,6 +132,33 @@ def maybe_cuda_synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _all_to_all_variable(
+    tensor: torch.Tensor,
+    split_ids: torch.Tensor,
+    world_size: int,
+    group: dist.ProcessGroup | None = None,
+) -> tuple[torch.Tensor, list[int]]:
+    if world_size == 1:
+        return tensor, [tensor.size(0)]
+
+    send_sizes = torch.bincount(split_ids.to(dtype=torch.int64), minlength=world_size).to(
+        device=tensor.device
+    )
+    recv_sizes = torch.empty_like(send_sizes)
+    dist.all_to_all_single(recv_sizes, send_sizes, group=group)
+    send_split_sizes = [int(x) for x in send_sizes.tolist()]
+    recv_split_sizes = [int(x) for x in recv_sizes.tolist()]
+    output = tensor.new_empty((sum(recv_split_sizes), *tensor.shape[1:]))
+    dist.all_to_all_single(
+        output,
+        tensor.contiguous(),
+        output_split_sizes=recv_split_sizes,
+        input_split_sizes=send_split_sizes,
+        group=group,
+    )
+    return output, recv_split_sizes
+
+
 def _fmt_time_s_to_ms_or_us(seconds: float) -> str:
     """Format a time given in seconds to a string in ms or µs.
 
@@ -140,8 +167,6 @@ def _fmt_time_s_to_ms_or_us(seconds: float) -> str:
     ms = seconds * 1e3
     if ms < 0.01:
         us = ms * 1e3
-        if us < 0.01:
-            return f"{us * 1e3:.2f}ns"
         return f"{us:.2f}µs"
     return f"{ms:.2f}ms"
 
@@ -252,6 +277,8 @@ class LPLBMoE(nn.Module):
         planner: Planner | None,
         disable_load_balancing: bool,
         static_log2phy: torch.Tensor | None,
+        rank: int,
+        world_size: int,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -260,10 +287,18 @@ class LPLBMoE(nn.Module):
         self.top_k = top_k
         self.planner = planner
         self.disable_load_balancing = disable_load_balancing
+        self.rank = rank
+        self.world_size = world_size
+
+        if num_physical_experts % world_size != 0:
+            raise ValueError('num_physical_experts must be divisible by world_size for expert sharding')
+        self.local_experts_per_rank = num_physical_experts // world_size
+        self.local_expert_start = rank * self.local_experts_per_rank
+        self.local_expert_end = self.local_expert_start + self.local_experts_per_rank
 
         self.router = nn.Linear(hidden_size, num_logical_experts, bias=False)
         self.experts = nn.ModuleList(
-            [ExpertMLP(hidden_size, moe_hidden_size) for _ in range(num_physical_experts)]
+            [ExpertMLP(hidden_size, moe_hidden_size) for _ in range(self.local_experts_per_rank)]
         )
         self.register_buffer(
             'workload_history',
@@ -321,6 +356,83 @@ class LPLBMoE(nn.Module):
         for key in self._router_profile_sums:
             self._router_profile_sums[key] = 0.0
         return result
+
+    def _dispatch_to_local_experts(
+        self,
+        route_hidden: torch.Tensor,
+        route_token_indices: torch.Tensor,
+        route_physical_ids: torch.Tensor,
+        route_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.world_size == 1:
+            local_outputs = torch.zeros_like(route_hidden)
+            for local_expert_id, expert in enumerate(self.experts):
+                expert_mask = route_physical_ids == local_expert_id
+                if expert_mask.any():
+                    expert_out = expert(route_hidden[expert_mask])
+                    local_outputs[expert_mask] = expert_out * route_weights[expert_mask].unsqueeze(-1)
+            return local_outputs, route_token_indices, torch.zeros_like(route_token_indices)
+
+        route_owner_ranks = route_physical_ids // self.local_experts_per_rank
+        route_local_experts = route_physical_ids % self.local_experts_per_rank
+
+        send_order = torch.argsort(route_owner_ranks)
+        route_hidden = route_hidden.index_select(0, send_order)
+        route_token_indices = route_token_indices.index_select(0, send_order)
+        route_weights = route_weights.index_select(0, send_order)
+        route_local_experts = route_local_experts.index_select(0, send_order)
+        route_owner_ranks = route_owner_ranks.index_select(0, send_order)
+        route_source_ranks = torch.full_like(route_owner_ranks, self.rank)
+
+        recv_hidden, _ = _all_to_all_variable(
+            route_hidden,
+            route_owner_ranks,
+            self.world_size,
+        )
+        recv_token_indices, _ = _all_to_all_variable(
+            route_token_indices,
+            route_owner_ranks,
+            self.world_size,
+        )
+        recv_weights, _ = _all_to_all_variable(
+            route_weights,
+            route_owner_ranks,
+            self.world_size,
+        )
+        recv_local_experts, _ = _all_to_all_variable(
+            route_local_experts,
+            route_owner_ranks,
+            self.world_size,
+        )
+        recv_source_ranks, _ = _all_to_all_variable(
+            route_source_ranks,
+            route_owner_ranks,
+            self.world_size,
+        )
+
+        local_outputs = torch.zeros_like(recv_hidden)
+        for local_expert_id, expert in enumerate(self.experts):
+            expert_mask = recv_local_experts == local_expert_id
+            if expert_mask.any():
+                expert_out = expert(recv_hidden[expert_mask])
+                local_outputs[expert_mask] = expert_out * recv_weights[expert_mask].unsqueeze(-1)
+
+        send_back_order = torch.argsort(recv_source_ranks)
+        local_outputs = local_outputs.index_select(0, send_back_order)
+        recv_token_indices = recv_token_indices.index_select(0, send_back_order)
+        recv_source_ranks = recv_source_ranks.index_select(0, send_back_order)
+
+        returned_outputs, _ = _all_to_all_variable(
+            local_outputs,
+            recv_source_ranks,
+            self.world_size,
+        )
+        returned_token_indices, _ = _all_to_all_variable(
+            recv_token_indices,
+            recv_source_ranks,
+            self.world_size,
+        )
+        return returned_outputs, returned_token_indices, recv_source_ranks
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_size = x.shape
@@ -387,13 +499,16 @@ class LPLBMoE(nn.Module):
             maybe_cuda_synchronize(flat.device)
             self._router_profile_sums['router_dispatch_prep_ms'] += (time.perf_counter() - dispatch_start) * 1e3
 
+        route_outputs, route_token_indices, _ = self._dispatch_to_local_experts(
+            flat_inputs,
+            token_indices,
+            flat_physical,
+            flat_weights,
+        )
+
         output = torch.zeros_like(flat)
-        for expert_id in range(self.num_physical_experts):
-            expert_mask = flat_physical == expert_id
-            if expert_mask.any():
-                expert_out = self.experts[expert_id](flat_inputs[expert_mask])
-                weighted = expert_out * flat_weights[expert_mask].unsqueeze(-1)
-                output.index_add_(0, token_indices[expert_mask], weighted)
+        if route_outputs.numel() > 0:
+            output.index_add_(0, route_token_indices, route_outputs)
 
         return output.view(batch_size, sequence_length, hidden_size), self.router_aux_loss(
             topk_logical, topk_weights
@@ -412,6 +527,8 @@ class TinyMoeBlock(nn.Module):
         planner: Planner | None,
         disable_load_balancing: bool,
         static_log2phy: torch.Tensor | None,
+        rank: int,
+        world_size: int,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size)
@@ -426,6 +543,8 @@ class TinyMoeBlock(nn.Module):
             planner,
             disable_load_balancing,
             static_log2phy,
+            rank,
+            world_size,
         )
 
     def refresh_mapping(self, rank: int) -> None:
@@ -457,6 +576,8 @@ class TinyMoeLM(nn.Module):
         planner: Planner | None,
         disable_load_balancing: bool,
         static_log2phy: torch.Tensor | None,
+        rank: int,
+        world_size: int,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
@@ -474,6 +595,8 @@ class TinyMoeLM(nn.Module):
                     planner,
                     disable_load_balancing,
                     static_log2phy,
+                    rank,
+                    world_size,
                 )
                 for _ in range(num_layers)
             ]
@@ -519,7 +642,9 @@ def synchronize_shared_grads(model: nn.Module) -> None:
         return
 
     base_model = unwrap_model(model)
-    for _name, parameter in base_model.named_parameters():
+    for name, parameter in base_model.named_parameters():
+        if '.moe.experts.' in name:
+            continue
         if parameter.grad is None:
             continue
         dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
@@ -622,6 +747,11 @@ def main() -> None:
     disable_load_balancing = bool(args.disable_load_balancing or args.redundants_per_rank == 0)
     num_logical_experts = NUM_LOGICAL_EXPERTS
     num_physical_experts = num_logical_experts + args.redundants_per_rank * world_size
+    if num_physical_experts % world_size != 0:
+        raise RuntimeError(
+            'physical experts must divide evenly across ranks for expert sharding '
+            f'(got {num_physical_experts} experts across {world_size} ranks)'
+        )
     local_experts_per_gpu = num_physical_experts // world_size
 
     texts = build_corpus(args.cache_dir)
@@ -668,16 +798,9 @@ def main() -> None:
         planner=planner,
         disable_load_balancing=disable_load_balancing,
         static_log2phy=static_log2phy,
+        rank=rank,
+        world_size=world_size,
     ).to(device)
-
-    if distributed:
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            broadcast_buffers=False,
-            find_unused_parameters=True,
-        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -761,6 +884,7 @@ def main() -> None:
         lm_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target_ids.reshape(-1))
         loss = lm_loss + args.aux_loss_weight * aux_loss
         loss.backward()
+        synchronize_shared_grads(base_model)
         if step_should_profile and backward_start is not None:
             maybe_cuda_synchronize(device)
             profile_sums['backward'] += time.perf_counter() - backward_start
