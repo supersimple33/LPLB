@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--num-heads', type=int, default=4)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--weight-decay', type=float, default=0.1)
-    parser.add_argument('--aux-loss-weight', type=float, default=0.01)
+    parser.add_argument('--aux-loss-weight', type=float, default=0.1)
     parser.add_argument('--profile-interval', type=int, default=10)
     parser.add_argument('--profile-warmup', type=int, default=20)
     parser.add_argument('--seed', type=int, default=42)
@@ -130,6 +130,20 @@ def log(rank: int, message: str) -> None:
 def maybe_cuda_synchronize(device: torch.device) -> None:
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
+
+
+def _fmt_time_s_to_ms_or_us(seconds: float) -> str:
+    """Format a time given in seconds to a string in ms or µs.
+
+    If the value is smaller than 0.01 ms, render in microseconds; otherwise render in milliseconds.
+    """
+    ms = seconds * 1e3
+    if ms < 0.01:
+        us = ms * 1e3
+        if us < 0.01:
+            return f"{us * 1e3:.2f}ns"
+        return f"{us:.2f}µs"
+    return f"{ms:.2f}ms"
 
 
 def reduce_mean_scalar(value: float, device: torch.device) -> float:
@@ -261,6 +275,13 @@ class LPLBMoE(nn.Module):
             static_log2phy if static_log2phy is not None else torch.empty(0, 2, dtype=torch.int32),
             persistent=False,
         )
+        self._router_profile_sums = {
+            'router_kernel_ms': 0.0,
+            'planner_run_ms': 0.0,
+            'router_topk_ms': 0.0,
+            'router_assignment_ms': 0.0,
+            'router_dispatch_prep_ms': 0.0,
+        }
 
     def refresh_mapping(self, rank: int) -> None:
         if self.disable_load_balancing or self.planner is None:
@@ -294,12 +315,40 @@ class LPLBMoE(nn.Module):
         denom = importance.sum().clamp_min(1.0) * load.sum().clamp_min(1.0)
         return self.num_logical_experts * (importance * load).sum() / denom
 
+    def pop_router_profile(self) -> dict[str, float]:
+        result = dict(self._router_profile_sums)
+        result['router_events'] = 0.0
+        for key in self._router_profile_sums:
+            self._router_profile_sums[key] = 0.0
+        return result
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_size = x.shape
         flat = x.reshape(batch_size * sequence_length, hidden_size)
+        use_router_timing = flat.is_cuda
+
+        if use_router_timing:
+            maybe_cuda_synchronize(flat.device)
+            router_start = time.perf_counter()
+
         router_logits = self.router(flat)
+
+        if use_router_timing:
+            maybe_cuda_synchronize(flat.device)
+            self._router_profile_sums['router_kernel_ms'] += (time.perf_counter() - router_start) * 1e3
+
+        if use_router_timing:
+            maybe_cuda_synchronize(flat.device)
+            topk_start = time.perf_counter()
         topk_logits, topk_logical = router_logits.topk(self.top_k, dim=-1)
         topk_weights = F.softmax(topk_logits.float(), dim=-1).to(dtype=flat.dtype)
+        if use_router_timing:
+            maybe_cuda_synchronize(flat.device)
+            self._router_profile_sums['router_topk_ms'] += (time.perf_counter() - topk_start) * 1e3
+
+        if use_router_timing:
+            maybe_cuda_synchronize(flat.device)
+            assign_start = time.perf_counter()
 
         if self.disable_load_balancing or self.planner is None:
             static_log2phy = cast(torch.Tensor, self.static_log2phy)
@@ -313,12 +362,30 @@ class LPLBMoE(nn.Module):
             workload_history.add_(counts)
 
             avail_counter = torch.zeros((), dtype=torch.int32, device=flat.device)
+            if use_router_timing:
+                maybe_cuda_synchronize(flat.device)
+                planner_start = time.perf_counter()
             topk_physical = self.planner.run(topk_logical, avail_counter)
+            if use_router_timing:
+                maybe_cuda_synchronize(flat.device)
+                self._router_profile_sums['planner_run_ms'] += (time.perf_counter() - planner_start) * 1e3
+
+        if use_router_timing:
+            maybe_cuda_synchronize(flat.device)
+            self._router_profile_sums['router_assignment_ms'] += (time.perf_counter() - assign_start) * 1e3
+
+        if use_router_timing:
+            maybe_cuda_synchronize(flat.device)
+            dispatch_start = time.perf_counter()
 
         token_indices = torch.arange(flat.size(0), device=flat.device).repeat_interleave(self.top_k)
         flat_inputs = flat.index_select(0, token_indices)
         flat_physical = topk_physical.reshape(-1)
         flat_weights = topk_weights.reshape(-1)
+
+        if use_router_timing:
+            maybe_cuda_synchronize(flat.device)
+            self._router_profile_sums['router_dispatch_prep_ms'] += (time.perf_counter() - dispatch_start) * 1e3
 
         output = torch.zeros_like(flat)
         for expert_id in range(self.num_physical_experts):
@@ -363,6 +430,9 @@ class TinyMoeBlock(nn.Module):
 
     def refresh_mapping(self, rank: int) -> None:
         self.moe.refresh_mapping(rank)
+
+    def pop_router_profile(self) -> dict[str, float]:
+        return self.moe.pop_router_profile()
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         attn_input = self.norm1(x)
@@ -425,6 +495,19 @@ class TinyMoeLM(nn.Module):
             aux_loss = aux_loss + block_aux_loss
         x = self.final_norm(x)
         return self.lm_head(x), aux_loss
+
+    def pop_router_profile(self) -> dict[str, float]:
+        totals = {
+            'router_topk_ms': 0.0,
+            'router_assignment_ms': 0.0,
+            'router_dispatch_prep_ms': 0.0,
+            'router_events': 0.0,
+        }
+        for block in self.blocks:
+            block_stats = cast(TinyMoeBlock, block).pop_router_profile()
+            for key in totals:
+                totals[key] += block_stats[key]
+        return totals
 
 
 def unwrap_model(model: nn.Module) -> TinyMoeLM:
@@ -623,6 +706,11 @@ def main() -> None:
         'forward': 0.0,
         'backward': 0.0,
         'step': 0.0,
+        'router_kernel': 0.0,
+        'planner_run': 0.0,
+        'router_topk': 0.0,
+        'router_assignment': 0.0,
+        'router_dispatch_prep': 0.0,
     }
     profile_count = 0
 
@@ -662,6 +750,12 @@ def main() -> None:
         if step_should_profile and forward_start is not None:
             maybe_cuda_synchronize(device)
             profile_sums['forward'] += time.perf_counter() - forward_start
+            router_stats = base_model.pop_router_profile()
+            profile_sums['router_kernel'] += router_stats.get('router_kernel_ms', 0.0) / 1e3
+            profile_sums['planner_run'] += router_stats.get('planner_run_ms', 0.0) / 1e3
+            profile_sums['router_topk'] += router_stats['router_topk_ms'] / 1e3
+            profile_sums['router_assignment'] += router_stats['router_assignment_ms'] / 1e3
+            profile_sums['router_dispatch_prep'] += router_stats['router_dispatch_prep_ms'] / 1e3
 
         backward_start = time.perf_counter() if step_should_profile else None
         lm_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target_ids.reshape(-1))
@@ -701,6 +795,11 @@ def main() -> None:
                 profile_sums['forward'],
                 profile_sums['backward'],
                 profile_sums['step'],
+                profile_sums['router_kernel'],
+                profile_sums['planner_run'],
+                profile_sums['router_topk'],
+                profile_sums['router_assignment'],
+                profile_sums['router_dispatch_prep'],
             ],
             device=device,
             dtype=torch.float64,
@@ -713,15 +812,27 @@ def main() -> None:
             avg = profile_values / profile_count
             total_s = float(avg[0].item())
             tokens_per_sec = (args.batch_size * world_size * args.seq_len) / max(total_s, 1e-12)
+
+            def _fmt_idx(i: int) -> str:
+                return _fmt_time_s_to_ms_or_us(float(avg[i].item()))
+
+            router_total_s = sum(float(avg[i].item()) for i in range(6, 11))
+
             print(
                 '\n[profile aggregate]\n'
                 f'  steps profiled: {profile_count}\n'
-                f'  total time: {avg[0].item() * 1e3:.2f}ms/step\n'
-                f'  data loading: {avg[1].item() * 1e3:.2f}ms\n'
-                f'  refresh mapping: {avg[2].item() * 1e3:.2f}ms\n'
-                f'  forward pass: {avg[3].item() * 1e3:.2f}ms\n'
-                f'  backward pass: {avg[4].item() * 1e3:.2f}ms\n'
-                f'  optimizer step: {avg[5].item() * 1e3:.2f}ms\n'
+                f'  total time: {_fmt_time_s_to_ms_or_us(float(avg[0].item()))}/step\n'
+                f'  data loading: {_fmt_idx(1)}\n'
+                f'  refresh mapping: {_fmt_idx(2)}\n'
+                f'  forward pass: {_fmt_idx(3)}\n'
+                f'  backward pass: {_fmt_idx(4)}\n'
+                f'  optimizer step: {_fmt_idx(5)}\n'
+                f'  router kernel (self.router): {_fmt_idx(6)}\n'
+                f'  planner.run: {_fmt_idx(7)}\n'
+                f'  router topk+weights: {_fmt_idx(8)}\n'
+                f'  router assignment: {_fmt_idx(9)}\n'
+                f'  router dispatch prep: {_fmt_idx(10)}\n'
+                f'  router total: {_fmt_time_s_to_ms_or_us(router_total_s)}\n'
                 f'  throughput: {tokens_per_sec:.2f} tokens/sec',
                 flush=True,
             )
