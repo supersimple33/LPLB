@@ -181,6 +181,8 @@ struct compiled_solver {
         "--relocatable-device-code=true",
         "-I" + mathdx_path + "include",
         "-I" + mathdx_path + "external/cutlass/include",
+        "-I" + std::string(std::getenv("CUDA_HOME")) + "/include/cccl",
+        "-I" + std::string(std::getenv("CUDA_HOME")) + "/include",
         "-DGROUP_SIZE=" + std::to_string(group_size),
         "-DDUP_PER_RANK=" + std::to_string(dup_per_rank),
         "-DSM_Ver=" + std::to_string(arch * 10),

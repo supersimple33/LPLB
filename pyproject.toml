@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Linear-programming-based expert parallelism load balancing."
 authors = [{ name = "Huanqi Cao", email = "caohuanqi@deepseek.com" }]
 dependencies = ["torch"]
-requires-python = ">=3.8"
+requires-python = ">=3.8,<3.14"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

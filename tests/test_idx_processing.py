@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from lplb.planner import Planner
-from tests.utils import CUBE_8P2E
+from utils import CUBE_8P2E
 
 
 @pytest.mark.parametrize(
