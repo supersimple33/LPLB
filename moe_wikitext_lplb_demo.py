@@ -736,46 +736,44 @@ def main() -> None:
             if is_main_process(rank):
                 print(f'eval step={step + 1:04d} loss={eval_loss:.4f}', flush=True)
 
-        if profile_enabled and profile_count > 0 and profile_count % profile_window == 0:
-            profile_values = torch.tensor(
-                [
-                    profile_sums['total'],
-                    profile_sums['data'],
-                    profile_sums['refresh'],
-                    profile_sums['forward'],
-                    profile_sums['backward'],
-                    profile_sums['step'],
-                ],
-                device=device,
-                dtype=torch.float64,
-            )
-            if dist.is_initialized():
-                dist.all_reduce(profile_values, op=dist.ReduceOp.SUM)
-                profile_values.div_(dist.get_world_size())
-
-            if is_main_process(rank):
-                avg = profile_values / profile_window
-                total_s = float(avg[0].item())
-                tokens_per_sec = (args.batch_size * world_size * args.seq_len) / max(total_s, 1e-12)
-                print(
-                    '[profile] '
-                    f'steps={step - profile_window + 2:04d}-{step + 1:04d} '
-                    f'total={avg[0].item() * 1e3:.2f}ms '
-                    f'data={avg[1].item() * 1e3:.2f}ms '
-                    f'refresh={avg[2].item() * 1e3:.2f}ms '
-                    f'forward={avg[3].item() * 1e3:.2f}ms '
-                    f'backward={avg[4].item() * 1e3:.2f}ms '
-                    f'optim={avg[5].item() * 1e3:.2f}ms '
-                    f'tokens_per_sec={tokens_per_sec:.2f}',
-                    flush=True,
-                )
-            for key in profile_sums:
-                profile_sums[key] = 0.0
-            profile_count = 0
-
     final_eval_loss = evaluate(model, valid_loader, device, args.aux_loss_weight)
     if is_main_process(rank):
         print(f'final eval loss={final_eval_loss:.4f}', flush=True)
+
+    # Print aggregated profiling summary
+    if profile_enabled and profile_count > 0:
+        profile_values = torch.tensor(
+            [
+                profile_sums['total'],
+                profile_sums['data'],
+                profile_sums['refresh'],
+                profile_sums['forward'],
+                profile_sums['backward'],
+                profile_sums['step'],
+            ],
+            device=device,
+            dtype=torch.float64,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(profile_values, op=dist.ReduceOp.SUM)
+            profile_values.div_(dist.get_world_size())
+
+        if is_main_process(rank):
+            avg = profile_values / profile_count
+            total_s = float(avg[0].item())
+            tokens_per_sec = (args.batch_size * world_size * args.seq_len) / max(total_s, 1e-12)
+            print(
+                '\n[profile aggregate]\n'
+                f'  steps profiled: {profile_count}\n'
+                f'  total time: {avg[0].item() * 1e3:.2f}ms/step\n'
+                f'  data loading: {avg[1].item() * 1e3:.2f}ms\n'
+                f'  refresh mapping: {avg[2].item() * 1e3:.2f}ms\n'
+                f'  forward pass: {avg[3].item() * 1e3:.2f}ms\n'
+                f'  backward pass: {avg[4].item() * 1e3:.2f}ms\n'
+                f'  optimizer step: {avg[5].item() * 1e3:.2f}ms\n'
+                f'  throughput: {tokens_per_sec:.2f} tokens/sec',
+                flush=True,
+            )
 
     cleanup_distributed()
 
