@@ -17,7 +17,7 @@ import os
 import re
 import time
 from pathlib import Path
-from collections import Counter
+from collections import Counter, deque
 from typing import cast
 
 from datasets import load_dataset
@@ -317,6 +317,7 @@ class LPLBMoE(nn.Module):
             'router_assignment_ms': 0.0,
             'router_dispatch_prep_ms': 0.0,
         }
+        self._recent_global_workload_max: deque[int] = deque(maxlen=10)
 
     def refresh_mapping(self, rank: int) -> None:
         if self.disable_load_balancing or self.planner is None:
@@ -330,8 +331,11 @@ class LPLBMoE(nn.Module):
         )
         if is_main_process(rank):
             max_history = int(global_history.max().item())
+            self._recent_global_workload_max.append(max_history)
+            recent_window_max = max(self._recent_global_workload_max)
             print(
-                f'[rank {rank}] refreshed LPLB mapping; global workload max = {max_history}',
+                f'[rank {rank}] refreshed LPLB mapping; '
+                f'global workload max (last 10 refreshes) = {recent_window_max}',
                 flush=True,
             )
         self.planner.phy2log = phy2log
@@ -821,12 +825,12 @@ def main() -> None:
     )
 
     profile_enabled = args.profile_interval > 0
-    profile_window = max(1, args.profile_interval)
     profile_sums = {
         'total': 0.0,
         'data': 0.0,
         'refresh': 0.0,
         'forward': 0.0,
+        'aux': 0.0,
         'backward': 0.0,
         'step': 0.0,
         'router_kernel': 0.0,
@@ -879,10 +883,15 @@ def main() -> None:
             profile_sums['router_topk'] += router_stats['router_topk_ms'] / 1e3
             profile_sums['router_assignment'] += router_stats['router_assignment_ms'] / 1e3
             profile_sums['router_dispatch_prep'] += router_stats['router_dispatch_prep_ms'] / 1e3
+            try:
+                profile_sums['aux'] += float(aux_loss.item())
+            except Exception:
+                profile_sums['aux'] += 0.0
 
         backward_start = time.perf_counter() if step_should_profile else None
         lm_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target_ids.reshape(-1))
-        loss = lm_loss + args.aux_loss_weight * aux_loss
+        # Do not add auxiliary router loss to the training objective (aux-loss-free LB).
+        loss = lm_loss
         loss.backward()
         synchronize_shared_grads(base_model)
         if step_should_profile and backward_start is not None:
@@ -917,6 +926,7 @@ def main() -> None:
                 profile_sums['data'],
                 profile_sums['refresh'],
                 profile_sums['forward'],
+                profile_sums['aux'],
                 profile_sums['backward'],
                 profile_sums['step'],
                 profile_sums['router_kernel'],
@@ -936,11 +946,12 @@ def main() -> None:
             avg = profile_values / profile_count
             total_s = float(avg[0].item())
             tokens_per_sec = (args.batch_size * world_size * args.seq_len) / max(total_s, 1e-12)
+            aux_value = float(avg[4].item())
 
             def _fmt_idx(i: int) -> str:
                 return _fmt_time_s_to_ms_or_us(float(avg[i].item()))
 
-            router_total_s = sum(float(avg[i].item()) for i in range(6, 11))
+            router_total_s = sum(float(avg[i].item()) for i in range(7, 12))
 
             print(
                 '\n[profile aggregate]\n'
@@ -949,13 +960,14 @@ def main() -> None:
                 f'  data loading: {_fmt_idx(1)}\n'
                 f'  refresh mapping: {_fmt_idx(2)}\n'
                 f'  forward pass: {_fmt_idx(3)}\n'
-                f'  backward pass: {_fmt_idx(4)}\n'
-                f'  optimizer step: {_fmt_idx(5)}\n'
-                f'  router kernel (self.router): {_fmt_idx(6)}\n'
-                f'  planner.run: {_fmt_idx(7)}\n'
-                f'  router topk+weights: {_fmt_idx(8)}\n'
-                f'  router assignment: {_fmt_idx(9)}\n'
-                f'  router dispatch prep: {_fmt_idx(10)}\n'
+                f'  aux metric: {aux_value:.6f}\n'
+                f'  backward pass: {_fmt_idx(5)}\n'
+                f'  optimizer step: {_fmt_idx(6)}\n'
+                f'  router kernel (self.router): {_fmt_idx(7)}\n'
+                f'  planner.run: {_fmt_idx(8)}\n'
+                f'  router topk+weights: {_fmt_idx(9)}\n'
+                f'  router assignment: {_fmt_idx(10)}\n'
+                f'  router dispatch prep: {_fmt_idx(11)}\n'
                 f'  router total: {_fmt_time_s_to_ms_or_us(router_total_s)}\n'
                 f'  throughput: {tokens_per_sec:.2f} tokens/sec',
                 flush=True,
