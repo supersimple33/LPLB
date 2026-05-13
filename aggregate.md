@@ -101,3 +101,21 @@ info 2 redundants with parallel dispatch and async comm
   router dispatch prep: 0.65ms
   router total: 217.31ms
   throughput: 1053.06 tokens/sec
+
+info 1 redundants with parallel dispatch and async comm
+[profile aggregate]
+  steps profiled: 85
+  total time: 3899.59ms/step
+  data loading: 17.85ms
+  refresh mapping: 15.54ms
+  forward pass: 3496.23ms
+  aux metric: 17.659202
+  backward pass: 377.51ms
+  optimizer step: 6.79ms
+  router kernel (self.router): 0.00µs
+  planner.run: 0.00µs
+  router topk+weights: 1.71ms
+  router assignment: 213.52ms
+  router dispatch prep: 0.61ms
+  router total: 215.83ms
+  throughput: 1050.37 tokens/sec
