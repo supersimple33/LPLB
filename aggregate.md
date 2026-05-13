@@ -63,3 +63,23 @@ info for 2 redundants
   router dispatch prep: 0.61ms
   router total: 188.32ms
   throughput: 1671.47 tokens/sec
+
+
+
+info 2 redundants with parallel dispatch
+[profile aggregate]
+  steps profiled: 95
+  total time: 2611.71ms/step
+  data loading: 17.80ms
+  refresh mapping: 16.46ms
+  forward pass: 2526.46ms
+  aux metric: 12.679115
+  backward pass: 64.75ms
+  optimizer step: 2.20ms
+  router kernel (self.router): 0.00µs
+  planner.run: 0.00µs
+  router topk+weights: 1.58ms
+  router assignment: 193.23ms
+  router dispatch prep: 0.60ms
+  router total: 195.41ms
+  throughput: 1568.32 tokens/sec

@@ -84,6 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--tokenizer-name', type=str, default='gpt2')
     parser.add_argument('--redundants-per-rank', type=int, default=2)
     parser.add_argument('--disable-load-balancing', action='store_true')
+    parser.add_argument('--enable-early-dispatch', action='store_true', help='Enable two-phase dispatch overlapping')
     parser.add_argument('--hidden-size', type=int, default=DEFAULT_HIDDEN_SIZE)
     parser.add_argument('--moe-hidden-size', type=int, default=DEFAULT_MOE_HIDDEN)
     parser.add_argument('--num-layers', type=int, default=4)
@@ -279,6 +280,7 @@ class LPLBMoE(nn.Module):
         static_log2phy: torch.Tensor | None,
         rank: int,
         world_size: int,
+        enable_early_dispatch: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -318,6 +320,8 @@ class LPLBMoE(nn.Module):
             'router_dispatch_prep_ms': 0.0,
         }
         self._recent_global_workload_max: deque[int] = deque(maxlen=10)
+        self._prev_topk_physical: torch.Tensor | None = None
+        self._enable_early_dispatch = enable_early_dispatch
 
     def refresh_mapping(self, rank: int) -> None:
         if self.disable_load_balancing or self.planner is None:
@@ -466,6 +470,11 @@ class LPLBMoE(nn.Module):
             maybe_cuda_synchronize(flat.device)
             assign_start = time.perf_counter()
 
+        # Optionally use early dispatch with planner overlap
+        early_physical: torch.Tensor | None = None
+        if self._enable_early_dispatch and self._prev_topk_physical is not None and not (self.disable_load_balancing or self.planner is None):
+            early_physical = self._prev_topk_physical
+
         if self.disable_load_balancing or self.planner is None:
             static_log2phy = cast(torch.Tensor, self.static_log2phy)
             if static_log2phy.numel() > 0:
@@ -533,6 +542,7 @@ class TinyMoeBlock(nn.Module):
         static_log2phy: torch.Tensor | None,
         rank: int,
         world_size: int,
+        enable_early_dispatch: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size)
@@ -549,6 +559,7 @@ class TinyMoeBlock(nn.Module):
             static_log2phy,
             rank,
             world_size,
+            enable_early_dispatch,
         )
 
     def refresh_mapping(self, rank: int) -> None:
@@ -582,6 +593,7 @@ class TinyMoeLM(nn.Module):
         static_log2phy: torch.Tensor | None,
         rank: int,
         world_size: int,
+        enable_early_dispatch: bool = False,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
@@ -601,6 +613,7 @@ class TinyMoeLM(nn.Module):
                     static_log2phy,
                     rank,
                     world_size,
+                    enable_early_dispatch,
                 )
                 for _ in range(num_layers)
             ]
@@ -804,6 +817,7 @@ def main() -> None:
         static_log2phy=static_log2phy,
         rank=rank,
         world_size=world_size,
+        enable_early_dispatch=args.enable_early_dispatch,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
