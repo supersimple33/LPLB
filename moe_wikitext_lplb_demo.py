@@ -84,6 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--tokenizer-name', type=str, default='gpt2')
     parser.add_argument('--redundants-per-rank', type=int, default=2)
     parser.add_argument('--disable-load-balancing', action='store_true')
+    parser.add_argument(
+        '--balance-threshold',
+        type=int,
+        default=0,
+        help='Only run the LPLB solver when the hottest-coldest device load spread exceeds this many tokens',
+    )
     parser.add_argument('--enable-early-dispatch', action='store_true', help='Enable two-phase dispatch overlapping')
     parser.add_argument('--hidden-size', type=int, default=DEFAULT_HIDDEN_SIZE)
     parser.add_argument('--moe-hidden-size', type=int, default=DEFAULT_MOE_HIDDEN)
@@ -280,6 +286,7 @@ class LPLBMoE(nn.Module):
         static_log2phy: torch.Tensor | None,
         rank: int,
         world_size: int,
+        balance_threshold: int = 0,
         enable_early_dispatch: bool = False,
     ) -> None:
         super().__init__()
@@ -291,6 +298,7 @@ class LPLBMoE(nn.Module):
         self.disable_load_balancing = disable_load_balancing
         self.rank = rank
         self.world_size = world_size
+        self.balance_threshold = balance_threshold
 
         if num_physical_experts % world_size != 0:
             raise ValueError('num_physical_experts must be divisible by world_size for expert sharding')
@@ -323,6 +331,16 @@ class LPLBMoE(nn.Module):
         self._prev_topk_physical: torch.Tensor | None = None
         self._enable_early_dispatch = enable_early_dispatch
 
+    def _device_load_spread(self, workload: torch.Tensor) -> tuple[int, torch.Tensor]:
+        planner = self.planner
+        if planner is None:
+            raise RuntimeError('planner must be set to compute device load spread')
+        phy2log = cast(torch.Tensor, planner.phy2log)
+        device_loads = workload[phy2log.view(self.world_size, self.local_experts_per_rank)].sum(dim=-1)
+        hottest = int(device_loads.max().item())
+        coldest = int(device_loads.min().item())
+        return hottest - coldest, device_loads
+
     def refresh_mapping(self, rank: int) -> None:
         if self.disable_load_balancing or self.planner is None:
             return
@@ -330,6 +348,15 @@ class LPLBMoE(nn.Module):
         global_history = workload_history.clone()
         if dist.is_initialized():
             dist.all_reduce(global_history, op=dist.ReduceOp.SUM)
+        device_spread, _device_loads = self._device_load_spread(global_history)
+        if device_spread <= self.balance_threshold:
+            if is_main_process(rank):
+                print(
+                    f'[rank {rank}] skipped LPLB refresh; device load spread={device_spread} '
+                    f'threshold={self.balance_threshold}',
+                    flush=True,
+                )
+            return
         phy2log, _log2phy, _logcnt = self.planner.update_redundancy_mapping(
             global_history.to(dtype=torch.int32)
         )
@@ -339,7 +366,8 @@ class LPLBMoE(nn.Module):
             recent_window_max = max(self._recent_global_workload_max)
             print(
                 f'[rank {rank}] refreshed LPLB mapping; '
-                f'global workload max (last 10 refreshes) = {recent_window_max}',
+                f'global workload max (last 10 refreshes) = {recent_window_max}; '
+                f'device load spread={device_spread} threshold={self.balance_threshold}',
                 flush=True,
             )
         self.planner.phy2log = phy2log
@@ -446,6 +474,7 @@ class LPLBMoE(nn.Module):
         batch_size, sequence_length, hidden_size = x.shape
         flat = x.reshape(batch_size * sequence_length, hidden_size)
         use_router_timing = flat.is_cuda
+        router_start = topk_start = assign_start = planner_start = dispatch_start = 0.0
 
         if use_router_timing:
             maybe_cuda_synchronize(flat.device)
@@ -542,6 +571,7 @@ class TinyMoeBlock(nn.Module):
         static_log2phy: torch.Tensor | None,
         rank: int,
         world_size: int,
+        balance_threshold: int = 0,
         enable_early_dispatch: bool = False,
     ) -> None:
         super().__init__()
@@ -559,6 +589,7 @@ class TinyMoeBlock(nn.Module):
             static_log2phy,
             rank,
             world_size,
+            balance_threshold,
             enable_early_dispatch,
         )
 
@@ -593,6 +624,7 @@ class TinyMoeLM(nn.Module):
         static_log2phy: torch.Tensor | None,
         rank: int,
         world_size: int,
+        balance_threshold: int = 0,
         enable_early_dispatch: bool = False,
     ) -> None:
         super().__init__()
@@ -613,6 +645,7 @@ class TinyMoeLM(nn.Module):
                     static_log2phy,
                     rank,
                     world_size,
+                    balance_threshold,
                     enable_early_dispatch,
                 )
                 for _ in range(num_layers)
@@ -817,6 +850,7 @@ def main() -> None:
         static_log2phy=static_log2phy,
         rank=rank,
         world_size=world_size,
+        balance_threshold=args.balance_threshold,
         enable_early_dispatch=args.enable_early_dispatch,
     ).to(device)
 

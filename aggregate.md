@@ -65,21 +65,38 @@ info for 2 redundants
   throughput: 1671.47 tokens/sec
 
 
-
-info 2 redundants with parallel dispatch
+info for 2 redundant with high lplb threshold
 [profile aggregate]
-  steps profiled: 95
-  total time: 2611.71ms/step
-  data loading: 17.80ms
-  refresh mapping: 16.46ms
-  forward pass: 2526.46ms
-  aux metric: 12.679115
-  backward pass: 64.75ms
-  optimizer step: 2.20ms
+  steps profiled: 85
+  total time: 2425.95ms/step
+  data loading: 19.76ms
+  refresh mapping: 17.90ms
+  forward pass: 2339.23ms
+  aux metric: 13.576462
+  backward pass: 62.45ms
+  optimizer step: 4.08ms
   router kernel (self.router): 0.00µs
   planner.run: 0.00µs
-  router topk+weights: 1.58ms
-  router assignment: 193.23ms
+  router topk+weights: 1.65ms
+  router assignment: 210.96ms
   router dispatch prep: 0.60ms
-  router total: 195.41ms
-  throughput: 1568.32 tokens/sec
+  router total: 213.21ms
+  throughput: 1688.41 tokens/sec
+
+info for 1 redundant with high lplb threshold
+[profile aggregate]
+  steps profiled: 85
+  total time: 2563.09ms/step
+  data loading: 18.09ms
+  refresh mapping: 16.40ms
+  forward pass: 2478.36ms
+  aux metric: 12.906646
+  backward pass: 63.59ms
+  optimizer step: 2.64ms
+  router kernel (self.router): 0.00µs
+  planner.run: 0.00µs
+  router topk+weights: 1.76ms
+  router assignment: 217.62ms
+  router dispatch prep: 0.61ms
+  router total: 219.99ms
+  throughput: 1598.07 tokens/sec
