@@ -69,7 +69,7 @@ info for 2 redundants
 info 2 redundants with parallel dispatch
 [profile aggregate]
   steps profiled: 95
-  total time: 2611.71ms/step
+  total time: 2611.71ms/step 4123ms/step
   data loading: 17.80ms
   refresh mapping: 16.46ms
   forward pass: 2526.46ms
@@ -83,3 +83,21 @@ info 2 redundants with parallel dispatch
   router dispatch prep: 0.60ms
   router total: 195.41ms
   throughput: 1568.32 tokens/sec
+
+info 2 redundants with parallel dispatch and async comm
+[profile aggregate]
+  steps profiled: 85
+  total time: 3889.62ms/step
+  data loading: 19.22ms
+  refresh mapping: 16.79ms
+  forward pass: 3467.76ms
+  aux metric: 17.639570
+  backward pass: 393.74ms
+  optimizer step: 7.41ms
+  router kernel (self.router): 0.00µs
+  planner.run: 0.00µs
+  router topk+weights: 1.67ms
+  router assignment: 214.99ms
+  router dispatch prep: 0.65ms
+  router total: 217.31ms
+  throughput: 1053.06 tokens/sec

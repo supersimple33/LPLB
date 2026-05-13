@@ -85,6 +85,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--redundants-per-rank', type=int, default=2)
     parser.add_argument('--disable-load-balancing', action='store_true')
     parser.add_argument('--enable-early-dispatch', action='store_true', help='Enable two-phase dispatch overlapping')
+    parser.add_argument(
+        '--enable-async-dispatch',
+        action='store_true',
+        help='Enable non-blocking all-to-all for overlap with local expert compute',
+    )
     parser.add_argument('--hidden-size', type=int, default=DEFAULT_HIDDEN_SIZE)
     parser.add_argument('--moe-hidden-size', type=int, default=DEFAULT_MOE_HIDDEN)
     parser.add_argument('--num-layers', type=int, default=4)
@@ -158,6 +163,34 @@ def _all_to_all_variable(
         group=group,
     )
     return output, recv_split_sizes
+
+
+def _all_to_all_variable_async(
+    tensor: torch.Tensor,
+    split_ids: torch.Tensor,
+    world_size: int,
+    group: dist.ProcessGroup | None = None,
+) -> tuple[torch.Tensor, list[int], dist.Work | None]:
+    if world_size == 1:
+        return tensor, [tensor.size(0)], None
+
+    send_sizes = torch.bincount(split_ids.to(dtype=torch.int64), minlength=world_size).to(
+        device=tensor.device
+    )
+    recv_sizes = torch.empty_like(send_sizes)
+    dist.all_to_all_single(recv_sizes, send_sizes, group=group)
+    send_split_sizes = [int(x) for x in send_sizes.tolist()]
+    recv_split_sizes = [int(x) for x in recv_sizes.tolist()]
+    output = tensor.new_empty((sum(recv_split_sizes), *tensor.shape[1:]))
+    work = dist.all_to_all_single(
+        output,
+        tensor.contiguous(),
+        output_split_sizes=recv_split_sizes,
+        input_split_sizes=send_split_sizes,
+        group=group,
+        async_op=True,
+    )
+    return output, recv_split_sizes, work
 
 
 def _fmt_time_s_to_ms_or_us(seconds: float) -> str:
@@ -281,6 +314,7 @@ class LPLBMoE(nn.Module):
         rank: int,
         world_size: int,
         enable_early_dispatch: bool = False,
+        enable_async_dispatch: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -320,8 +354,12 @@ class LPLBMoE(nn.Module):
             'router_dispatch_prep_ms': 0.0,
         }
         self._recent_global_workload_max: deque[int] = deque(maxlen=10)
-        self._prev_topk_physical: torch.Tensor | None = None
+        self._cached_log2phy: torch.Tensor | None = None
         self._enable_early_dispatch = enable_early_dispatch
+        self._enable_async_dispatch = enable_async_dispatch
+        self._comm_stream: torch.cuda.Stream | None = None
+        if enable_async_dispatch and torch.cuda.is_available():
+            self._comm_stream = torch.cuda.Stream()
 
     def refresh_mapping(self, rank: int) -> None:
         if self.disable_load_balancing or self.planner is None:
@@ -330,9 +368,10 @@ class LPLBMoE(nn.Module):
         global_history = workload_history.clone()
         if dist.is_initialized():
             dist.all_reduce(global_history, op=dist.ReduceOp.SUM)
-        phy2log, _log2phy, _logcnt = self.planner.update_redundancy_mapping(
+        phy2log, log2phy, _logcnt = self.planner.update_redundancy_mapping(
             global_history.to(dtype=torch.int32)
         )
+        self._cached_log2phy = log2phy
         if is_main_process(rank):
             max_history = int(global_history.max().item())
             self._recent_global_workload_max.append(max_history)
@@ -384,54 +423,118 @@ class LPLBMoE(nn.Module):
         route_owner_ranks = route_physical_ids // self.local_experts_per_rank
         route_local_experts = route_physical_ids % self.local_experts_per_rank
 
-        send_order = torch.argsort(route_owner_ranks)
-        route_hidden = route_hidden.index_select(0, send_order)
-        route_token_indices = route_token_indices.index_select(0, send_order)
-        route_weights = route_weights.index_select(0, send_order)
-        route_local_experts = route_local_experts.index_select(0, send_order)
-        route_owner_ranks = route_owner_ranks.index_select(0, send_order)
-        route_source_ranks = torch.full_like(route_owner_ranks, self.rank)
+        local_mask = route_owner_ranks == self.rank
+        local_hidden = route_hidden[local_mask]
+        local_token_indices = route_token_indices[local_mask]
+        local_weights = route_weights[local_mask]
+        local_experts = route_local_experts[local_mask]
 
-        recv_hidden, _ = _all_to_all_variable(
-            route_hidden,
-            route_owner_ranks,
-            self.world_size,
-        )
-        recv_token_indices, _ = _all_to_all_variable(
-            route_token_indices,
-            route_owner_ranks,
-            self.world_size,
-        )
-        recv_weights, _ = _all_to_all_variable(
-            route_weights,
-            route_owner_ranks,
-            self.world_size,
-        )
-        recv_local_experts, _ = _all_to_all_variable(
-            route_local_experts,
-            route_owner_ranks,
-            self.world_size,
-        )
-        recv_source_ranks, _ = _all_to_all_variable(
-            route_source_ranks,
-            route_owner_ranks,
-            self.world_size,
+        local_outputs = local_hidden.new_zeros((local_hidden.size(0), local_hidden.size(1)))
+
+        remote_hidden = route_hidden[~local_mask]
+        remote_token_indices = route_token_indices[~local_mask]
+        remote_weights = route_weights[~local_mask]
+        remote_local_experts = route_local_experts[~local_mask]
+        remote_owner_ranks = route_owner_ranks[~local_mask]
+        remote_source_ranks = torch.full_like(remote_owner_ranks, self.rank)
+
+        send_order = torch.argsort(remote_owner_ranks)
+        remote_hidden = remote_hidden.index_select(0, send_order)
+        remote_token_indices = remote_token_indices.index_select(0, send_order)
+        remote_weights = remote_weights.index_select(0, send_order)
+        remote_local_experts = remote_local_experts.index_select(0, send_order)
+        remote_owner_ranks = remote_owner_ranks.index_select(0, send_order)
+        remote_source_ranks = remote_source_ranks.index_select(0, send_order)
+
+        use_async = (
+            self._enable_async_dispatch
+            and route_hidden.is_cuda
+            and dist.is_initialized()
+            and self._comm_stream is not None
         )
 
-        local_outputs = torch.zeros_like(recv_hidden)
+        if use_async:
+            with torch.cuda.stream(self._comm_stream):
+                recv_hidden, _, work_hidden = _all_to_all_variable_async(
+                    remote_hidden,
+                    remote_owner_ranks,
+                    self.world_size,
+                )
+                recv_token_indices, _, work_token = _all_to_all_variable_async(
+                    remote_token_indices,
+                    remote_owner_ranks,
+                    self.world_size,
+                )
+                recv_weights, _, work_weights = _all_to_all_variable_async(
+                    remote_weights,
+                    remote_owner_ranks,
+                    self.world_size,
+                )
+                recv_local_experts, _, work_experts = _all_to_all_variable_async(
+                    remote_local_experts,
+                    remote_owner_ranks,
+                    self.world_size,
+                )
+                recv_source_ranks, _, work_sources = _all_to_all_variable_async(
+                    remote_source_ranks,
+                    remote_owner_ranks,
+                    self.world_size,
+                )
+            for local_expert_id, expert in enumerate(self.experts):
+                expert_mask = local_experts == local_expert_id
+                if expert_mask.any():
+                    expert_out = expert(local_hidden[expert_mask])
+                    local_outputs[expert_mask] = expert_out * local_weights[expert_mask].unsqueeze(-1)
+            for work in (work_hidden, work_token, work_weights, work_experts, work_sources):
+                if work is not None:
+                    work.wait()
+            torch.cuda.current_stream().wait_stream(self._comm_stream)
+        else:
+            for local_expert_id, expert in enumerate(self.experts):
+                expert_mask = local_experts == local_expert_id
+                if expert_mask.any():
+                    expert_out = expert(local_hidden[expert_mask])
+                    local_outputs[expert_mask] = expert_out * local_weights[expert_mask].unsqueeze(-1)
+            recv_hidden, _ = _all_to_all_variable(
+                remote_hidden,
+                remote_owner_ranks,
+                self.world_size,
+            )
+            recv_token_indices, _ = _all_to_all_variable(
+                remote_token_indices,
+                remote_owner_ranks,
+                self.world_size,
+            )
+            recv_weights, _ = _all_to_all_variable(
+                remote_weights,
+                remote_owner_ranks,
+                self.world_size,
+            )
+            recv_local_experts, _ = _all_to_all_variable(
+                remote_local_experts,
+                remote_owner_ranks,
+                self.world_size,
+            )
+            recv_source_ranks, _ = _all_to_all_variable(
+                remote_source_ranks,
+                remote_owner_ranks,
+                self.world_size,
+            )
+
+        recv_outputs = torch.zeros_like(recv_hidden)
         for local_expert_id, expert in enumerate(self.experts):
             expert_mask = recv_local_experts == local_expert_id
             if expert_mask.any():
                 expert_out = expert(recv_hidden[expert_mask])
-                local_outputs[expert_mask] = expert_out * recv_weights[expert_mask].unsqueeze(-1)
+                recv_outputs[expert_mask] = expert_out * recv_weights[expert_mask].unsqueeze(-1)
 
         send_back_order = torch.argsort(recv_source_ranks)
-        local_outputs = local_outputs.index_select(0, send_back_order)
+        recv_outputs = recv_outputs.index_select(0, send_back_order)
         recv_token_indices = recv_token_indices.index_select(0, send_back_order)
         recv_source_ranks = recv_source_ranks.index_select(0, send_back_order)
 
         returned_outputs, _ = _all_to_all_variable(
-            local_outputs,
+            recv_outputs,
             recv_source_ranks,
             self.world_size,
         )
@@ -440,7 +543,14 @@ class LPLBMoE(nn.Module):
             recv_source_ranks,
             self.world_size,
         )
-        return returned_outputs, returned_token_indices, recv_source_ranks
+
+        if local_outputs.numel() == 0:
+            return returned_outputs, returned_token_indices, recv_source_ranks
+        if returned_outputs.numel() == 0:
+            return local_outputs, local_token_indices, recv_source_ranks
+        combined_outputs = torch.cat([local_outputs, returned_outputs], dim=0)
+        combined_indices = torch.cat([local_token_indices, returned_token_indices], dim=0)
+        return combined_outputs, combined_indices, recv_source_ranks
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_size = x.shape
@@ -470,10 +580,14 @@ class LPLBMoE(nn.Module):
             maybe_cuda_synchronize(flat.device)
             assign_start = time.perf_counter()
 
-        # Optionally use early dispatch with planner overlap
-        early_physical: torch.Tensor | None = None
-        if self._enable_early_dispatch and self._prev_topk_physical is not None and not (self.disable_load_balancing or self.planner is None):
-            early_physical = self._prev_topk_physical
+        early_log2phy: torch.Tensor | None = None
+        if self._enable_early_dispatch:
+            if self._cached_log2phy is not None and self._cached_log2phy.numel() > 0:
+                early_log2phy = self._cached_log2phy
+            else:
+                static_log2phy = cast(torch.Tensor, self.static_log2phy)
+                if static_log2phy.numel() > 0:
+                    early_log2phy = static_log2phy
 
         if self.disable_load_balancing or self.planner is None:
             static_log2phy = cast(torch.Tensor, self.static_log2phy)
@@ -512,12 +626,46 @@ class LPLBMoE(nn.Module):
             maybe_cuda_synchronize(flat.device)
             self._router_profile_sums['router_dispatch_prep_ms'] += (time.perf_counter() - dispatch_start) * 1e3
 
-        route_outputs, route_token_indices, _ = self._dispatch_to_local_experts(
-            flat_inputs,
-            token_indices,
-            flat_physical,
-            flat_weights,
+        use_early_dispatch = (
+            self._enable_early_dispatch
+            and not self.disable_load_balancing
+            and self.planner is not None
         )
+        if use_early_dispatch:
+            if early_log2phy is not None:
+                if early_log2phy.device != topk_logical.device:
+                    early_log2phy = early_log2phy.to(topk_logical.device)
+                early_topk_physical = early_log2phy[topk_logical, 0]
+            else:
+                early_topk_physical = topk_logical
+            early_flat_physical = early_topk_physical.reshape(-1)
+            split_point = max(1, flat_inputs.size(0) // 10)
+            early_outputs, early_indices, _ = self._dispatch_to_local_experts(
+                flat_inputs[:split_point],
+                token_indices[:split_point],
+                early_flat_physical[:split_point],
+                flat_weights[:split_point],
+            )
+            late_outputs, late_indices, _ = self._dispatch_to_local_experts(
+                flat_inputs[split_point:],
+                token_indices[split_point:],
+                flat_physical[split_point:],
+                flat_weights[split_point:],
+            )
+            if early_outputs.numel() == 0:
+                route_outputs, route_token_indices = late_outputs, late_indices
+            elif late_outputs.numel() == 0:
+                route_outputs, route_token_indices = early_outputs, early_indices
+            else:
+                route_outputs = torch.cat([early_outputs, late_outputs], dim=0)
+                route_token_indices = torch.cat([early_indices, late_indices], dim=0)
+        else:
+            route_outputs, route_token_indices, _ = self._dispatch_to_local_experts(
+                flat_inputs,
+                token_indices,
+                flat_physical,
+                flat_weights,
+            )
 
         output = torch.zeros_like(flat)
         if route_outputs.numel() > 0:
@@ -543,6 +691,7 @@ class TinyMoeBlock(nn.Module):
         rank: int,
         world_size: int,
         enable_early_dispatch: bool = False,
+        enable_async_dispatch: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size)
@@ -560,6 +709,7 @@ class TinyMoeBlock(nn.Module):
             rank,
             world_size,
             enable_early_dispatch,
+            enable_async_dispatch,
         )
 
     def refresh_mapping(self, rank: int) -> None:
@@ -594,6 +744,7 @@ class TinyMoeLM(nn.Module):
         rank: int,
         world_size: int,
         enable_early_dispatch: bool = False,
+        enable_async_dispatch: bool = False,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
@@ -614,6 +765,7 @@ class TinyMoeLM(nn.Module):
                     rank,
                     world_size,
                     enable_early_dispatch,
+                    enable_async_dispatch,
                 )
                 for _ in range(num_layers)
             ]
@@ -818,6 +970,7 @@ def main() -> None:
         rank=rank,
         world_size=world_size,
         enable_early_dispatch=args.enable_early_dispatch,
+        enable_async_dispatch=args.enable_async_dispatch,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
