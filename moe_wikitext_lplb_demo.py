@@ -192,8 +192,6 @@ def build_redundancy_topology(group_size: int, num_redundants_per_rank: int) -> 
     for column in range(num_redundants_per_rank):
         topology[:, column] = (ranks + column + 1) % group_size
     return topology
-
-
 TOKEN_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+|[^\w\s]")
 
 
@@ -327,13 +325,13 @@ class LPLBMoE(nn.Module):
         self._enable_early_dispatch = enable_early_dispatch
 
     def refresh_mapping(self, rank: int) -> None:
-        if self.disable_load_balancing or self.planner is None:
+        if self.planner is None:
             return
         workload_history = cast(torch.Tensor, self.workload_history)
         global_history = workload_history.clone()
         if dist.is_initialized():
             dist.all_reduce(global_history, op=dist.ReduceOp.AVG)
-        phy2log, _log2phy, _logcnt = self.planner.update_redundancy_mapping(
+        phy2log, log2phy, _logcnt = self.planner.update_redundancy_mapping(
             global_history.round().to(dtype=torch.int32)
         )
         if is_main_process(rank):
@@ -346,6 +344,7 @@ class LPLBMoE(nn.Module):
                 flush=True,
             )
         self.planner.phy2log = phy2log
+        self.static_log2phy = log2phy
 
     def router_aux_loss(self, topk_indices: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
         flat_indices = topk_indices.reshape(-1)
@@ -449,6 +448,11 @@ class LPLBMoE(nn.Module):
         batch_size, sequence_length, hidden_size = x.shape
         flat = x.reshape(batch_size * sequence_length, hidden_size)
         use_router_timing = flat.is_cuda
+        router_start = time.perf_counter() if use_router_timing else 0.0
+        topk_start = 0.0
+        assign_start = 0.0
+        planner_start = 0.0
+        dispatch_start = 0.0
 
         if use_router_timing:
             maybe_cuda_synchronize(flat.device)
@@ -475,10 +479,16 @@ class LPLBMoE(nn.Module):
 
         # Optionally use early dispatch with planner overlap
         early_physical: torch.Tensor | None = None
-        if self._enable_early_dispatch and self._prev_topk_physical is not None and not (self.disable_load_balancing or self.planner is None):
+        use_planner = (
+            self.planner is not None
+            and not self.disable_load_balancing
+            and self.planner.num_redundants > 0
+        )
+
+        if self._enable_early_dispatch and self._prev_topk_physical is not None and use_planner:
             early_physical = self._prev_topk_physical
 
-        if self.disable_load_balancing or self.planner is None:
+        if not use_planner:
             static_log2phy = cast(torch.Tensor, self.static_log2phy)
             if static_log2phy.numel() > 0:
                 topk_physical = static_log2phy[topk_logical, 0]
@@ -498,6 +508,9 @@ class LPLBMoE(nn.Module):
             if use_router_timing:
                 maybe_cuda_synchronize(flat.device)
                 self._router_profile_sums['planner_run_ms'] += (time.perf_counter() - planner_start) * 1e3
+
+        if self._enable_early_dispatch:
+            self._prev_topk_physical = topk_physical.detach()
 
         if use_router_timing:
             maybe_cuda_synchronize(flat.device)
@@ -769,7 +782,7 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    disable_load_balancing = bool(args.disable_load_balancing or args.redundants_per_rank == 0)
+    disable_load_balancing = bool(args.disable_load_balancing)
     num_logical_experts = NUM_LOGICAL_EXPERTS
     num_physical_experts = num_logical_experts + args.redundants_per_rank * world_size
     if num_physical_experts % world_size != 0:
@@ -797,18 +810,14 @@ def main() -> None:
 
     r2o = build_redundancy_topology(world_size, args.redundants_per_rank).to(device)
     planner_group = cast(dist.ProcessGroup, dist.new_group()) if distributed else None
-    planner: Planner | None = None
-    static_log2phy: torch.Tensor | None = None
-    if args.redundants_per_rank > 0:
-        planner = Planner(
-            r2o,
-            num_physical_experts,
-            num_logical_experts,
-            ep_size=world_size,
-            group=planner_group,
-        )
-        if disable_load_balancing:
-            _static_phy2log, static_log2phy, _static_logcnt = planner.update_redundancy_mapping()
+    planner = Planner(
+        r2o,
+        num_physical_experts,
+        num_logical_experts,
+        ep_size=world_size,
+        group=planner_group,
+    )
+    _static_phy2log, static_log2phy, _static_logcnt = planner.update_redundancy_mapping()
 
     model = TinyMoeLM(
         vocab_size=len(tokenizer),

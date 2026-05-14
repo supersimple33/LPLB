@@ -2,16 +2,11 @@ from __future__ import annotations
 
 import functools
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import torch
 
 from lplb._cpp import CompiledSolver
-from lplb.eplb import rebalance_experts
-
-
-if TYPE_CHECKING:
-    from deep_ep import Buffer
+from lplb.eplb import rebalance_experts, rebalance_experts2
 
 
 @functools.lru_cache(maxsize=None)
@@ -82,9 +77,12 @@ class Planner:
         self.n_local_routed_experts = self.n_routed_experts // self.ep_size
         self.n_local_logical_routed_experts = self.n_logical_routed_experts // self.ep_size
         # Combine redundant experts into `self.r2o.shape[1]` groups for LP solving.
-        self.combined_redundant_experts = (
-            self.n_local_routed_experts - self.n_local_logical_routed_experts
-        ) // self.num_redundants
+        if self.num_redundants > 0:
+            self.combined_redundant_experts = (
+                self.n_local_routed_experts - self.n_local_logical_routed_experts
+            ) // self.num_redundants
+        else:
+            self.combined_redundant_experts = 0
 
         # Default phy2log mapping for use when no reordering is applied.
         self.phy2log: torch.Tensor
@@ -92,14 +90,15 @@ class Planner:
 
         self.ep_group = group
         self.deep_ep_initialized = False
-        self.solver = _get_solver(
-            self.n_group,
-            self.group_size,
-            self.num_redundants,
-            self.n_local_routed_experts,
-            self.combined_redundant_experts,
-            self.ep_group,
-        )
+        if self.num_redundants > 0:
+            self.solver = _get_solver(
+                self.n_group,
+                self.group_size,
+                self.num_redundants,
+                self.n_local_routed_experts,
+                self.combined_redundant_experts,
+                self.ep_group,
+            )
 
     def init_from_deep_ep(self, buffer: Buffer) -> None:
         if self.deep_ep_initialized:
@@ -170,7 +169,7 @@ class Planner:
 
         logcnt = torch.tensor([len(x) for x in log2phy], dtype=torch.int32, device=device)
         max_logcnt = int(logcnt.max())
-        assert max_logcnt == 2
+        assert max_logcnt == 2 or (max_logcnt == 1 and self.num_redundants == 0), "Each logical expert can have at most one redundant copy"
         log2phy = torch.tensor(
             [x + [-1] * (max_logcnt - len(x)) for x in log2phy],
             dtype=torch.int32,
