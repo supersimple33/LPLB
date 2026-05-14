@@ -42,8 +42,8 @@ FALLBACK_VOCAB_SIZE = 8_000
 
 R2O_SQUARE_4P2E = torch.tensor(
     [
-        [2, 0, 1, 3],
-        [3, 1, 0, 2],
+        [1, 2, 3, 0],  # slot 0: each rank points to next rank
+        [3, 0, 1, 2],  # slot 1: each rank points to prev rank
     ],
     dtype=torch.int32,
 ).T
