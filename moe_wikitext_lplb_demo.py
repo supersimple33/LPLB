@@ -85,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--redundants-per-rank', type=int, default=2)
     parser.add_argument('--disable-load-balancing', action='store_true')
     parser.add_argument('--enable-early-dispatch', action='store_true', help='Enable two-phase dispatch overlapping')
+    parser.add_argument('--ema-alpha', type=float, default=0.1, help='EMA smoothing factor for workload history (0-1)')
     parser.add_argument('--hidden-size', type=int, default=DEFAULT_HIDDEN_SIZE)
     parser.add_argument('--moe-hidden-size', type=int, default=DEFAULT_MOE_HIDDEN)
     parser.add_argument('--num-layers', type=int, default=4)
@@ -281,6 +282,7 @@ class LPLBMoE(nn.Module):
         rank: int,
         world_size: int,
         enable_early_dispatch: bool = False,
+        ema_alpha: float = 0.1,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -304,9 +306,10 @@ class LPLBMoE(nn.Module):
         )
         self.register_buffer(
             'workload_history',
-            torch.zeros(num_logical_experts, dtype=torch.int64),
+            torch.zeros(num_logical_experts, dtype=torch.float32),
             persistent=False,
         )
+        self.ema_alpha = ema_alpha
         self.register_buffer(
             'static_log2phy',
             static_log2phy if static_log2phy is not None else torch.empty(0, 2, dtype=torch.int32),
@@ -329,9 +332,9 @@ class LPLBMoE(nn.Module):
         workload_history = cast(torch.Tensor, self.workload_history)
         global_history = workload_history.clone()
         if dist.is_initialized():
-            dist.all_reduce(global_history, op=dist.ReduceOp.SUM)
+            dist.all_reduce(global_history, op=dist.ReduceOp.AVG)
         phy2log, _log2phy, _logcnt = self.planner.update_redundancy_mapping(
-            global_history.to(dtype=torch.int32)
+            global_history.round().to(dtype=torch.int32)
         )
         if is_main_process(rank):
             max_history = int(global_history.max().item())
@@ -484,7 +487,8 @@ class LPLBMoE(nn.Module):
         else:
             counts = torch.bincount(topk_logical.reshape(-1), minlength=self.num_logical_experts)
             workload_history = cast(torch.Tensor, self.workload_history)
-            workload_history.add_(counts)
+            # Update workload_history with EMA: new = old * (1 - alpha) + counts * alpha
+            workload_history.mul_(1 - self.ema_alpha).add_(counts.float(), alpha=self.ema_alpha)
 
             avail_counter = torch.zeros((), dtype=torch.int32, device=flat.device)
             if use_router_timing:
@@ -543,6 +547,7 @@ class TinyMoeBlock(nn.Module):
         rank: int,
         world_size: int,
         enable_early_dispatch: bool = False,
+        ema_alpha: float = 0.1,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size)
@@ -560,6 +565,7 @@ class TinyMoeBlock(nn.Module):
             rank,
             world_size,
             enable_early_dispatch,
+            ema_alpha,
         )
 
     def refresh_mapping(self, rank: int) -> None:
@@ -594,6 +600,7 @@ class TinyMoeLM(nn.Module):
         rank: int,
         world_size: int,
         enable_early_dispatch: bool = False,
+        ema_alpha: float = 0.1,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
@@ -614,6 +621,7 @@ class TinyMoeLM(nn.Module):
                     rank,
                     world_size,
                     enable_early_dispatch,
+                    ema_alpha,
                 )
                 for _ in range(num_layers)
             ]
@@ -818,6 +826,7 @@ def main() -> None:
         rank=rank,
         world_size=world_size,
         enable_early_dispatch=args.enable_early_dispatch,
+        ema_alpha=args.ema_alpha,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
