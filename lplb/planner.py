@@ -111,6 +111,75 @@ class Planner:
             buffer.num_rdma_bytes == 0,
         )
 
+    def update_redundancy_mapping2(
+        self, cooccurrence_workload: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        device = 'cuda'
+        # "nored": No redundancy. Run EPLB without redundancy.
+        if cooccurrence_workload is None:
+            nored_phy2log = torch.arange(
+                self.n_logical_routed_experts,
+                device=device,
+                dtype=torch.int32,
+            )
+        else:
+            nored_phy2log, _, _ = tuple(
+                x.squeeze(0).to(dtype=torch.int32, device=device)
+                for x in rebalance_experts2(
+                    cooccurrence_workload,
+                    self.n_logical_routed_experts,
+                    self.n_group,
+                    max(1, self.ep_size // torch.cuda.device_count()),
+                    self.ep_size,
+                )
+            )
+        nored_phy2log = nored_phy2log.reshape(
+            self.n_group,
+            self.group_size,
+            self.n_local_logical_routed_experts,
+        )
+        if cooccurrence_workload is not None:
+            # Sort experts on each device by co-occurrence workload history.
+            nored_phy2log = nored_phy2log.gather(
+                dim=-1,
+                index=cooccurrence_workload[nored_phy2log].argsort(dim=-1, descending=True),
+            )
+        # "tored": To be made redundant.
+        # Select the top `combined_redundant_experts * num_redundants` experts on each device.
+        tored_log_ori = nored_phy2log[
+            :, :, : self.combined_redundant_experts * self.num_redundants
+        ].reshape(
+            self.n_group,
+            self.group_size,
+            self.combined_redundant_experts,
+            self.num_redundants,
+        )
+        tored_log_dup = tored_log_ori.gather(
+            dim=1,
+            index=self.r2o.long().unsqueeze(1).expand_as(tored_log_ori),
+        )
+        phy2log = torch.cat([nored_phy2log, tored_log_dup.flatten(2)], dim=-1).flatten()
+        assert phy2log.shape[0] == self.n_routed_experts
+
+        log2phy = [[] for _ in range(self.n_logical_routed_experts)]
+        # Transpose phy2log before inserting into log2phy to ensure original experts precede copies.
+        for phy_local, logs in enumerate(phy2log.reshape(self.ep_size, -1).T):
+            for phy_ep_rank, log in enumerate(logs):
+                log2phy[int(log)].append(phy_ep_rank * self.n_local_routed_experts + phy_local)
+
+        logcnt = torch.tensor([len(x) for x in log2phy], dtype=torch.int32, device=device)
+        max_logcnt = int(logcnt.max())
+        assert max_logcnt == 2
+        log2phy = torch.tensor(
+            [x + [-1] * (max_logcnt - len(x)) for x in log2phy],
+            dtype=torch.int32,
+            device=device,
+        )
+
+        self.phy2log = phy2log
+
+        return phy2log, log2phy, logcnt
+
     def update_redundancy_mapping(
         self, workload: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

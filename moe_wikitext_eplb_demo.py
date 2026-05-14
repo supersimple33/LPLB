@@ -288,7 +288,7 @@ class EPLBMoE(nn.Module):
         
         self.register_buffer(
             'workload_history',
-            torch.zeros(num_logical_experts, dtype=torch.float32),
+            torch.zeros(num_logical_experts, num_logical_experts, dtype=torch.float32),
             persistent=False,
         )
         self.ema_alpha = ema_alpha
@@ -307,10 +307,13 @@ class EPLBMoE(nn.Module):
         global_history = workload_history.clone()
         if dist.is_initialized():
             dist.all_reduce(global_history, op=dist.ReduceOp.AVG)
+
+        # Collapse pairwise co-location history to per-expert load before EPLB.
+        reduced_history = global_history.sum(dim=-1)
         
         # Call EPLB rebalancing
         # weight shape: [num_layers, num_logical_experts]
-        weight = global_history.unsqueeze(0).round().to(dtype=torch.int32)
+        weight = reduced_history.unsqueeze(0).round().to(dtype=torch.int32)
         phy2log, log2phy, _logcnt = rebalance_experts(
             weight,
             num_replicas=self.num_physical_experts,
@@ -326,7 +329,7 @@ class EPLBMoE(nn.Module):
         self.log2phy = new_log2phy
         
         if is_main_process(rank):
-            max_history = int(global_history.max().item())
+            max_history = int(reduced_history.max().item())
             self._recent_global_workload_max.append(max_history)
             recent_window_max = max(self._recent_global_workload_max)
             print(
@@ -494,10 +497,14 @@ class EPLBMoE(nn.Module):
             flat_weights,
         )
 
-        # Update workload history with EMA
+        # Update pairwise workload history with EMA.
+        # For experts i and j on the same device, add count_i to [i, j].
         counts = torch.bincount(topk_logical.reshape(-1), minlength=self.num_logical_experts)
+        expert_owner = log2phy.to(dtype=torch.int64) // self.local_experts_per_rank
+        colocated = expert_owner.unsqueeze(1) == expert_owner.unsqueeze(0)
+        pairwise_counts = counts.float().unsqueeze(1) * colocated.float()
         workload_history = cast(torch.Tensor, self.workload_history)
-        workload_history.mul_(1 - self.ema_alpha).add_(counts.float(), alpha=self.ema_alpha)
+        workload_history.mul_(1 - self.ema_alpha).add_(pairwise_counts, alpha=self.ema_alpha)
 
         output = torch.zeros_like(flat)
         if route_outputs.numel() > 0:

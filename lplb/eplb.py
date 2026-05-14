@@ -188,3 +188,115 @@ def rebalance_experts(
         torch.arange(num_replicas, dtype=torch.int64, device=log2phy.device).expand(num_layers, -1),
     )
     return phy2log, log2phy, logcnt
+
+def rebalance_experts2(
+    cooccurrence_weight: torch.Tensor, 
+    num_replicas: int, 
+    num_groups: int, 
+    num_nodes: int, 
+    num_gpus: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Similar to rebalance_experts but considers the cooccurrence of the experts.
+    Will try to load popular experts which co-occur onto different devices and those that do not co-occur onto the same device.
+    
+    Parameters:
+        cooccurrence_weight: [layers, num_logical_experts, num_logical_experts] or [num_logical_experts, num_logical_experts], 
+                             the cooccurrence statistics for all logical experts. Summing across the last axis 
+                             is equivalent to the marginal weight from rebalance_experts.
+        num_replicas: number of physical experts, must be a multiple of `num_gpus`
+        num_groups: number of expert groups (ignored here since communication efficiency is relaxed)
+        num_nodes: number of server nodes (ignored here since communication efficiency is relaxed)
+        num_gpus: number of GPUs, must be a multiple of `num_nodes`
+        
+    Returns:
+        physical_to_logical_map: [layers, num_replicas] or [num_replicas], the expert index of each replica
+        logical_to_physical_map: [layers, num_logical_experts, X] or [num_logical_experts, X], the replica indices for each expert
+        expert_count: [layers, num_logical_experts] or [num_logical_experts], number of physical replicas for each logical expert
+    """
+    device = cooccurrence_weight.device
+    
+    # Support both [E, E] for single layer and [L, E, E] for multi-layer inputs
+    is_2d = cooccurrence_weight.ndim == 2
+    if is_2d:
+        cooccurrence_weight = cooccurrence_weight.unsqueeze(0)
+        
+    cooc = cooccurrence_weight.float().cpu()
+    num_layers, num_logical_experts, _ = cooc.shape
+    
+    # 1. Marginal weight is equivalent to summing across the last axis
+    weight = cooc.sum(dim=-1) # Shape: [num_layers, num_logical_experts]
+    
+    # 2. Replicate experts to get the required number of physical replicas
+    # We leverage the replicate_experts function to allocate replicas based on marginal load
+    phy2log, phyrank, logcnt = replicate_experts(weight.to(device), num_replicas)
+    phy2log = phy2log.cpu()
+    
+    # 3. Pack physical experts across GPUs to minimize co-occurrence
+    assert num_replicas % num_gpus == 0
+    items_per_gpu = num_replicas // num_gpus
+    
+    pack_index = torch.full_like(phy2log, fill_value=-1)
+    rank_in_pack = torch.full_like(phy2log, fill_value=-1)
+    
+    for i in range(num_layers):
+        marginal = weight[i]
+        log_ids = phy2log[i]
+        
+        # Sort physical replicas descending based on their logical expert's marginal weight
+        item_weights = marginal[log_ids]
+        sorted_indices = item_weights.sort(descending=True).indices.tolist()
+        
+        gpu_items = [0] * num_gpus
+        gpu_marginal = [0.0] * num_gpus
+        gpu_contents = [[] for _ in range(num_gpus)]
+        
+        for idx in sorted_indices:
+            u = log_ids[idx].item()
+            best_gpu = -1
+            best_cost = float('inf')
+            
+            # Find the best GPU bin for this replica
+            for p in range(num_gpus):
+                if gpu_items[p] < items_per_gpu:
+                    # Cost combines GPU's existing marginal load + co-occurrence penalty with already placed experts
+                    cooc_cost = sum(cooc[i, u, v].item() for v in gpu_contents[p])
+                    cost = gpu_marginal[p] + cooc_cost
+                    
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_gpu = p
+                        
+            pack_index[i, idx] = best_gpu
+            rank_in_pack[i, idx] = gpu_items[best_gpu]
+            
+            # Update GPU state tracking
+            gpu_items[best_gpu] += 1
+            gpu_marginal[best_gpu] += marginal[u].item()
+            gpu_contents[best_gpu].append(u)
+            
+    # Calculate the new physical positions based on GPU packaging
+    final_phy_idx = pack_index * items_per_gpu + rank_in_pack
+    phy2log_reordered = torch.empty_like(phy2log)
+    phy2log_reordered.scatter_(-1, final_phy_idx, phy2log)
+    
+    # 4. Construct log2phy given the reordered physical-to-logical mapping
+    maxlogcnt = logcnt.max().item()
+    log2phy = torch.full(
+        (num_layers, num_logical_experts, maxlogcnt), -1, dtype=torch.int64, device=device
+    )
+    
+    current_logcnt = torch.zeros((num_layers, num_logical_experts), dtype=torch.int64)
+    for i in range(num_layers):
+        for p in range(num_replicas):
+            log_id = phy2log_reordered[i, p].item()
+            rank = current_logcnt[i, log_id].item()
+            log2phy[i, log_id, rank] = p
+            current_logcnt[i, log_id] += 1
+            
+    # Remove artificial layer dimension if the input was 2D
+    if is_2d:
+        phy2log_reordered = phy2log_reordered.squeeze(0)
+        log2phy = log2phy.squeeze(0)
+        logcnt = logcnt.squeeze(0)
+        
+    return phy2log_reordered.to(device), log2phy, logcnt.to(device)
