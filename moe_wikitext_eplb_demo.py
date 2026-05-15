@@ -36,12 +36,11 @@ from lplb.eplb import rebalance_experts
 
 
 NUM_LOGICAL_EXPERTS = 64
-TOP_K = 8
+TOP_K = 4
 EP_SIZE = 4
 DEFAULT_SEQ_LEN = 64
 DEFAULT_HIDDEN_SIZE = 128
 DEFAULT_MOE_HIDDEN = 1024
-FALLBACK_VOCAB_SIZE = 8_000
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train a tiny MoE LM with EPLB.')
@@ -635,12 +634,9 @@ def make_datasets(
     seq_len: int,
     max_train_tokens: int,
 ) -> tuple[PreTrainedTokenizerBase | SimpleTokenizer, SequenceDataset]:
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-    except Exception:
-        tokenizer = SimpleTokenizer(texts['train'], FALLBACK_VOCAB_SIZE)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     def encode_corpus(text: str, limit: int) -> list[int]:
         token_ids: list[int] = []
