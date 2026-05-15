@@ -302,6 +302,10 @@ class LPLBMoE(nn.Module):
             'router_assignment_ms': 0.0,
             'router_dispatch_prep_ms': 0.0,
         }
+        self._threshold_met_count = 0
+        self._threshold_not_met_count = 0
+        self._threshold_met_total_count = 0
+        self._threshold_not_met_total_count = 0
         self._recent_global_workload_max: deque[int] = deque(maxlen=10)
         self._prev_topk_physical: torch.Tensor | None = None
         self._enable_early_dispatch = enable_early_dispatch
@@ -359,6 +363,21 @@ class LPLBMoE(nn.Module):
         for key in self._router_profile_sums:
             self._router_profile_sums[key] = 0.0
         return result
+
+    def pop_threshold_counts(self) -> dict[str, float]:
+        result = {
+            'threshold_met_count': float(self._threshold_met_count),
+            'threshold_not_met_count': float(self._threshold_not_met_count),
+        }
+        self._threshold_met_count = 0
+        self._threshold_not_met_count = 0
+        return result
+
+    def get_threshold_totals(self) -> dict[str, float]:
+        return {
+            'threshold_met_total_count': float(self._threshold_met_total_count),
+            'threshold_not_met_total_count': float(self._threshold_not_met_total_count),
+        }
 
     def _dispatch_to_local_experts(
         self,
@@ -490,10 +509,14 @@ class LPLBMoE(nn.Module):
             
             if device_spread <= self.balance_threshold:
                 # Skip planner and use current logical to physical mapping
+                self._threshold_met_count += 1
+                self._threshold_met_total_count += 1
                 phy2log = cast(torch.Tensor, self.planner.phy2log)
                 log2phy = torch.argsort(phy2log)
                 topk_physical = log2phy[topk_logical]
             else:
+                self._threshold_not_met_count += 1
+                self._threshold_not_met_total_count += 1
                 avail_counter = torch.zeros((), dtype=torch.int32, device=flat.device)
                 if use_router_timing:
                     maybe_cuda_synchronize(flat.device)
@@ -578,6 +601,12 @@ class TinyMoeBlock(nn.Module):
     def pop_router_profile(self) -> dict[str, float]:
         return self.moe.pop_router_profile()
 
+    def pop_threshold_counts(self) -> dict[str, float]:
+        return self.moe.pop_threshold_counts()
+
+    def get_threshold_totals(self) -> dict[str, float]:
+        return self.moe.get_threshold_totals()
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         attn_input = self.norm1(x)
         attn_out, _attention_weights = self.attn(attn_input, attn_input, attn_input, need_weights=False)
@@ -657,6 +686,28 @@ class TinyMoeLM(nn.Module):
         }
         for block in self.blocks:
             block_stats = cast(TinyMoeBlock, block).pop_router_profile()
+            for key in totals:
+                totals[key] += block_stats[key]
+        return totals
+
+    def pop_threshold_counts(self) -> dict[str, float]:
+        totals = {
+            'threshold_met_count': 0.0,
+            'threshold_not_met_count': 0.0,
+        }
+        for block in self.blocks:
+            block_stats = cast(TinyMoeBlock, block).pop_threshold_counts()
+            for key in totals:
+                totals[key] += block_stats[key]
+        return totals
+
+    def get_threshold_totals(self) -> dict[str, float]:
+        totals = {
+            'threshold_met_total_count': 0.0,
+            'threshold_not_met_total_count': 0.0,
+        }
+        for block in self.blocks:
+            block_stats = cast(TinyMoeBlock, block).get_threshold_totals()
             for key in totals:
                 totals[key] += block_stats[key]
         return totals
@@ -930,14 +981,30 @@ def main() -> None:
             profile_sums['total'] += time.perf_counter() - step_total_start
             profile_count += 1
 
-        if is_main_process(rank) and step % 10 == 0:
-            ppl = math.exp(min(float(lm_loss.item()), 20.0))
-            print(
-                # step, loss, LM loss, aux loss, perplexity
-                f'step={step:04d} loss={float(loss.item()):.4f} '
-                f'lm={float(lm_loss.item()):.4f} aux={float(aux_loss.item()):.4f} ppl={ppl:.2f}',
-                flush=True,
+        threshold_values = torch.zeros(2, device=device, dtype=torch.float64)
+        if step % 10 == 0:
+            threshold_counts = base_model.pop_threshold_counts()
+            threshold_values = torch.tensor(
+                [
+                    threshold_counts['threshold_met_count'],
+                    threshold_counts['threshold_not_met_count'],
+                ],
+                device=device,
+                dtype=torch.float64,
             )
+            if dist.is_initialized():
+                dist.all_reduce(threshold_values, op=dist.ReduceOp.SUM)
+
+            if is_main_process(rank):
+                ppl = math.exp(min(float(lm_loss.item()), 20.0))
+                print(
+                    # step, loss, LM loss, aux loss, perplexity
+                    f'step={step:04d} loss={float(loss.item()):.4f} '
+                    f'lm={float(lm_loss.item()):.4f} aux={float(aux_loss.item()):.4f} ppl={ppl:.2f}',
+                    f'threshold_met={int(threshold_values[0].item())} '
+                    f'threshold_not_met={int(threshold_values[1].item())}',
+                    flush=True,
+                )
 
     # Print aggregated profiling summary
     if profile_enabled and profile_count > 0:
@@ -993,6 +1060,32 @@ def main() -> None:
                 f'  throughput: {tokens_per_sec:.2f} tokens/sec',
                 flush=True,
             )
+
+    threshold_totals_dict = base_model.get_threshold_totals()
+    threshold_totals = torch.tensor(
+        [
+            threshold_totals_dict['threshold_met_total_count'],
+            threshold_totals_dict['threshold_not_met_total_count'],
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    if dist.is_initialized():
+        dist.all_reduce(threshold_totals, op=dist.ReduceOp.SUM)
+
+    if is_main_process(rank):
+        total_threshold_checks = int(threshold_totals.sum().item())
+        met_total = int(threshold_totals[0].item())
+        not_met_total = int(threshold_totals[1].item())
+        met_rate = (met_total / max(total_threshold_checks, 1)) * 100.0
+        print(
+            '\n[threshold aggregate]\n'
+            f'  threshold met: {met_total}\n'
+            f'  threshold not met: {not_met_total}\n'
+            f'  threshold met rate: {met_rate:.2f}%\n'
+            f'  threshold checks: {total_threshold_checks}',
+            flush=True,
+        )
 
     cleanup_distributed()
 
