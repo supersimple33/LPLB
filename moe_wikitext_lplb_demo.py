@@ -42,36 +42,11 @@ FALLBACK_VOCAB_SIZE = 8_000
 
 R2O_SQUARE_4P2E = torch.tensor(
     [
-        [2, 0, 1, 3],
-        [3, 1, 0, 2],
+        [1, 2, 3, 0],  # slot 0: each rank points to next rank
+        [3, 0, 1, 2],  # slot 1: each rank points to prev rank
     ],
     dtype=torch.int32,
 ).T
-
-FALLBACK_CORPUS = {
-    'train': '''
-Deep learning systems often trade generality for speed.
-Mixture-of-experts models add conditional computation so that only a subset of experts
-handles each token. This makes it possible to scale model capacity without scaling
-per-token compute linearly.
-
-Load balancing matters because a router that sends many tokens to the same expert can
-create stragglers and waste hardware. A planner that redistributes expert assignments
-based on recent workload history can reduce the imbalance.
-
-Small training demos are useful because they let you validate routing logic, tensor
-shapes, and distributed execution before committing to a larger run.
-
-''',
-    'valid': '''
-Language models learn from token sequences and predict the next token at each step.
-A small corpus is enough to verify whether the training loop, optimizer, and routing
-mechanisms work together.
-''',
-    'test': '''
-This fallback text exists so the demo still runs when network access is unavailable.
-''',
-}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train a tiny MoE LM with LPLB.')
@@ -349,14 +324,6 @@ class LPLBMoE(nn.Module):
         if dist.is_initialized():
             dist.all_reduce(global_history, op=dist.ReduceOp.SUM)
         device_spread, _device_loads = self._device_load_spread(global_history)
-        if device_spread <= self.balance_threshold:
-            if is_main_process(rank):
-                print(
-                    f'[rank {rank}] skipped LPLB refresh; device load spread={device_spread} '
-                    f'threshold={self.balance_threshold}',
-                    flush=True,
-                )
-            return
         phy2log, _log2phy, _logcnt = self.planner.update_redundancy_mapping(
             global_history.to(dtype=torch.int32)
         )
@@ -367,7 +334,7 @@ class LPLBMoE(nn.Module):
             print(
                 f'[rank {rank}] refreshed LPLB mapping; '
                 f'global workload max (last 10 refreshes) = {recent_window_max}; '
-                f'device load spread={device_spread} threshold={self.balance_threshold}',
+                f'device load spread={device_spread}',
                 flush=True,
             )
         self.planner.phy2log = phy2log
@@ -515,14 +482,26 @@ class LPLBMoE(nn.Module):
             workload_history = cast(torch.Tensor, self.workload_history)
             workload_history.add_(counts)
 
-            avail_counter = torch.zeros((), dtype=torch.int32, device=flat.device)
-            if use_router_timing:
-                maybe_cuda_synchronize(flat.device)
-                planner_start = time.perf_counter()
-            topk_physical = self.planner.run(topk_logical, avail_counter)
-            if use_router_timing:
-                maybe_cuda_synchronize(flat.device)
-                self._router_profile_sums['planner_run_ms'] += (time.perf_counter() - planner_start) * 1e3
+            # Check device load spread to decide whether to run planner
+            global_history = workload_history.clone()
+            if dist.is_initialized():
+                dist.all_reduce(global_history, op=dist.ReduceOp.SUM)
+            device_spread, _device_loads = self._device_load_spread(global_history)
+            
+            if device_spread <= self.balance_threshold:
+                # Skip planner and use current logical to physical mapping
+                phy2log = cast(torch.Tensor, self.planner.phy2log)
+                log2phy = torch.argsort(phy2log)
+                topk_physical = log2phy[topk_logical]
+            else:
+                avail_counter = torch.zeros((), dtype=torch.int32, device=flat.device)
+                if use_router_timing:
+                    maybe_cuda_synchronize(flat.device)
+                    planner_start = time.perf_counter()
+                topk_physical = self.planner.run(topk_logical, avail_counter)
+                if use_router_timing:
+                    maybe_cuda_synchronize(flat.device)
+                    self._router_profile_sums['planner_run_ms'] += (time.perf_counter() - planner_start) * 1e3
 
         if use_router_timing:
             maybe_cuda_synchronize(flat.device)
@@ -703,15 +682,12 @@ def synchronize_shared_grads(model: nn.Module) -> None:
 
 def build_corpus(cache_dir: Path) -> dict[str, str]:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', cache_dir=str(cache_dir))
-        return {
-            'train': '\n'.join(dataset['train']['text']),
-            'valid': '\n'.join(dataset['validation']['text']),
-            'test': '\n'.join(dataset['test']['text']),
-        }
-    except Exception:
-        return FALLBACK_CORPUS.copy()
+    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', cache_dir=str(cache_dir))
+    return {
+        'train': '\n'.join(dataset['train']['text']),
+        'valid': '\n'.join(dataset['validation']['text']),
+        'test': '\n'.join(dataset['test']['text']),
+    }
 
 
 def make_datasets(
@@ -720,12 +696,9 @@ def make_datasets(
     seq_len: int,
     max_train_tokens: int,
 ) -> tuple[PreTrainedTokenizerBase | SimpleTokenizer, SequenceDataset]:
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-    except Exception:
-        tokenizer = SimpleTokenizer(texts['train'], FALLBACK_VOCAB_SIZE)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     def encode_corpus(text: str, limit: int) -> list[int]:
         token_ids: list[int] = []
