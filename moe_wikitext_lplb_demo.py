@@ -48,31 +48,6 @@ R2O_SQUARE_4P2E = torch.tensor(
     dtype=torch.int32,
 ).T
 
-FALLBACK_CORPUS = {
-    'train': '''
-Deep learning systems often trade generality for speed.
-Mixture-of-experts models add conditional computation so that only a subset of experts
-handles each token. This makes it possible to scale model capacity without scaling
-per-token compute linearly.
-
-Load balancing matters because a router that sends many tokens to the same expert can
-create stragglers and waste hardware. A planner that redistributes expert assignments
-based on recent workload history can reduce the imbalance.
-
-Small training demos are useful because they let you validate routing logic, tensor
-shapes, and distributed execution before committing to a larger run.
-
-''',
-    'valid': '''
-Language models learn from token sequences and predict the next token at each step.
-A small corpus is enough to verify whether the training loop, optimizer, and routing
-mechanisms work together.
-''',
-    'test': '''
-This fallback text exists so the demo still runs when network access is unavailable.
-''',
-}
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train a tiny MoE LM with LPLB.')
     parser.add_argument('--cache-dir', type=Path, default=Path.home() / '.cache' / 'lplb_moe_demo')
@@ -691,15 +666,12 @@ def synchronize_shared_grads(model: nn.Module) -> None:
 
 def build_corpus(cache_dir: Path) -> dict[str, str]:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', cache_dir=str(cache_dir))
-        return {
-            'train': '\n'.join(dataset['train']['text']),
-            'valid': '\n'.join(dataset['validation']['text']),
-            'test': '\n'.join(dataset['test']['text']),
-        }
-    except Exception:
-        return FALLBACK_CORPUS.copy()
+    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', cache_dir=str(cache_dir))
+    return {
+        'train': '\n'.join(dataset['train']['text']),
+        'valid': '\n'.join(dataset['validation']['text']),
+        'test': '\n'.join(dataset['test']['text']),
+    }
 
 
 def make_datasets(
